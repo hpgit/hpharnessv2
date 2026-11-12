@@ -1,0 +1,31 @@
+name: check
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Linux native development libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxi-dev libxrandr-dev
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: cargo test --workspace
+      - name: Python worker tests
+        shell: bash
+        env:
+          UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/.tools/python
+          UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+        run: uv run --python 3.13 --no-project python -m unittest discover -s packages/worker/tests -v

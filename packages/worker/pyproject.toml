@@ -1,0 +1,21 @@
+[project]
+name = "hpharness-worker"
+version = "0.1.0"
+description = "Standard-library execution worker for local, SSH, and Docker targets"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+office = ["pywin32>=308; sys_platform == 'win32'"]
+desktop = ["pywinauto>=0.6.9; sys_platform == 'win32'"]
+embedding = ["sentence-transformers[image]>=6.1.0", "transformers", "torch"]
+
+[project.scripts]
+hph-worker = "hph_worker:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["hph_worker", "remote", "embedding"]

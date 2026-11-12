@@ -1,0 +1,21 @@
+{
+  "name": "@hpharness/harness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test dist/test/*.test.js",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@hpharness/providers": "0.1.0",
+    "@hpharness/extensions": "0.1.0",
+    "cordis": "3.18.1",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.0.0",
+    "typescript": "6.0.2"
+  }
+}

@@ -1,0 +1,17 @@
+# Copy into the daemon data directory as settings.yaml, or edit in desktop settings.
+# A base URL or complete endpoint URL is accepted. No API key is needed by the local test server.
+provider:
+  protocol: responses
+  baseUrl: http://localhost:10100/v1
+  model: gpt-6-luna
+  timeoutMs: 120000
+  # apiKeyFile: ./secrets/provider-key.txt
+  # caPath: ./certificates/company-ca.pem
+  # proxy: http://proxy.example:8080
+maxAgents: 10
+maxModelRequests: 3
+# maxSteps: 50
+permissions:
+  command: ask
+  write: ask
+# pythonPath: F:/works-agents/hpharnessv2/.venv/Scripts/python.exe

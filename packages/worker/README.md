@@ -1,0 +1,25 @@
+# Execution worker
+
+The worker requires Python 3.10+ and has no mandatory third-party dependencies. Use `uv` with workspace-local `UV_PYTHON_INSTALL_DIR` and `UV_CACHE_DIR` for local environments. Optional Office COM support is installed with `uv pip install -e "packages/worker[office]"`.
+
+Local: `python packages/worker/hph_worker.py --root WORKSPACE --state-dir STATE_DIRECTORY`
+
+SSH: `python packages/worker/remote.py --host wsl --root /absolute/workspace`
+
+Docker through SSH: append `--container CONTAINER --root /container/workspace`. Existing OpenSSH configuration, including jump hosts, is reused. The helper deploys a content-addressed single worker file into the remote user's `.hpharness/workers/` and keeps job state separately. It never installs Python, changes SSH configuration, starts Docker automatically, or deletes existing containers.
+
+Each input line is `{ "id": 1, "method": "files.read", "params": { "path": "file.py" } }`; each output line contains `result` or `error`. Successful file reads return `content`, `encoding`, and `hash`. Writes require `expected_hash` (null only when creating a new file). Paths and cwd are confined to the chosen workspace, including resolved symlinks. **Commands are trusted execution, not sandboxed**: the supervisor is responsible for approval and effective permissions.
+
+`command.run` accepts an argv array, cwd and timeout. Results include `exit_code`, `status`, stdout/stderr tails and truncation flags. `jobs.start`, `jobs.status`, `jobs.list`, `jobs.cancel` keep processes and logs independent of the SSH transport. Cancelling writes a request; the detached owner terminates its child process tree and only then records cancellation. Files and logs remain for recovery. Host restart/crash recovery requires reconciliation; a recorded running state alone does not prove the process remains alive. Quotas and retention are managed by the supervisor.
+
+Additional methods: `docker.list/create/start/exec`, `adb.devices/run`, `gpu.submit/status/advance/cancel/upload/download`, `sdk.register/list/run`, `outlook.fetch/attachment`, `office.edit/ppt_templates/ppt_add`. GPU responses always carry `backend: dummy` and `simulated: true`. SDK command fixtures do not certify real QAIRT, enntools, or NeuroPilot compatibility. SDK results always retain the original ONNX identity; unsupported metrics remain absent. Office requires an explicit handoff, a prior file hash and a backup before editing. Template slides can be inspected and copied into an existing PowerPoint deck, with named text/image shapes replaced. Corporate DRM, Outlook profiles and actual SDKs are not available in the development environment and are not certified.
+
+Outlook archives unmodified body/HTML and message metadata as versioned `outlook_properties_v1` JSON; attachment metadata is recorded separately and attachment extraction is explicit. This representation is not a complete `.msg` backup. `archive_msg: true` optionally stores full `.msg` files, which include attachment bytes and therefore consume more of the 50 GB collection quota. Existing archives are never deleted on quota exhaustion. Attachments default to a 20 MB extraction limit. The supervisor owns the combined quota across all data sources.
+
+`desktop.windows/lease/read/action/revoke` use optional Windows UI Automation via `worker[desktop]`. A lease requires explicit handoff, binds the actual application process instance, expires after 600 seconds by default, and is revoked when user input is detected. Actions require the preceding accessibility snapshot; changed trees are rejected. These are capability adapters, not a validated integration with the corporate messenger.
+
+`embedding.py --model-dir LOCAL_MODEL --root WORKSPACE` provides separate JSONL `embedding.status/embed/pause/resume`. Install `worker[embedding]` only when needed. Text, code and local images use the official EmbeddingGemma 2 SentenceTransformer API, with query/document prompts, normalized 768-dimensional vectors and model/index fingerprints. No model weights or remote code are downloaded automatically. Query requests precede queued index batches; batches are limited to eight items and cannot be preempted midway through model inference. Missing weights/dependencies produce an explicit error with keyword fallback, never synthetic embeddings. See the [official guide](https://developers.googleblog.com/embeddinggemma-2-the-developer-guide/) for required local model artifacts and library support. Actual model inference remains unverified until those artifacts are configured.
+
+Tests: `uv run --python .tools/python/cpython-3.13.14-windows-x86_64-none/python.exe python -m unittest discover -s packages/worker/tests -v`.
+
+Set `HPH_TEST_SSH=wsl` to include live SSH disconnect/reconnect tests. `uv run python packages/worker/test_remote_suite.py wsl` copies only the worker's Python source/tests to an isolated remote home directory and runs the same suite using remote Python; retained test directories and job logs are printed for inspection.
