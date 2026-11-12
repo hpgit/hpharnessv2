@@ -2,6 +2,8 @@
 
 이 문서는 계획과 실제 검증 결과를 구분한다. 2026-11-13 개발 환경에서 Windows를 주 실행 환경으로, SSH config의 `wsl`을 원격 Linux 대상으로 사용했다. 사내 시스템·SDK·DRM 문서·실기기에는 접근하지 않았다.
 
+전체 진행 요약과 다음 작업의 우선순위·완료 기준은 [진행 현황](progress.md)에 정리한다. `6099e19`의 [Windows/Linux CI](https://github.com/hpgit/hpharnessv2/actions/runs/43322165266)는 모두 성공했으며 npm build/test, Rust workspace tests, Python worker tests를 포함한다.
+
 ## 실제 실행한 검증
 
 | 구성 | 검증 내용 |
@@ -30,7 +32,7 @@
 - Outlook·Office·UIA: optional worker 코드와 계약 테스트가 있다. 실제 회사 계정, DRM, 사내 메신저에서의 동작은 미검증이다.
 - EmbeddingGemma 2: 지정 모델 경로, modality·prompt·768차원·index fingerprint, 로컬 실행·fallback 계약을 구현했다. 실제 모델 가중치·선택 의존성이 없어 추론 성능과 품질은 검증하지 않았다.
 - Chrome: 확장프로그램·Rust bridge·정책 로직이 있다. 사용자의 실제 Chrome 프로필에 자동 설치하지 않았다. 사내 SSO/MFA·iframe·DRM 페이지 검증은 필요하다.
-- Linux Rust GUI: 코드와 CI matrix는 Linux를 포함한다. 현재 원격에 Rust와 GUI 개발 라이브러리가 없어 Linux 네이티브 빌드·창 실행은 현장에서 검증하지 못했다. CI 결과를 별도 확인해야 한다.
+- Linux Rust GUI: Linux CI에서 Rust 컴파일과 workspace tests는 통과했다. 실제 Linux GUI 창 실행·한국어 IME·배율 검증은 남아 있다. CI 성공을 수동 화면 검증 완료로 간주하지 않는다.
 - 사내 CA·proxy·mirror: 설정 경로는 구현했고 TLS 검증은 유지한다. 실제 사내 네트워크에서 연결 검증이 필요하다.
 
 ## 전체 요구사항 대비 남은 제품 작업
