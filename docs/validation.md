@@ -4,6 +4,8 @@
 
 전체 진행 요약과 다음 작업의 우선순위·완료 기준은 [진행 현황](progress.md)에 정리한다. `6099e19`의 [Windows/Linux CI](https://github.com/hpgit/hpharnessv2/actions/runs/43322165266)는 모두 성공했으며 npm build/test, Rust workspace tests, Python worker tests를 포함한다.
 
+이후 문서 커밋 `1a400e3`의 [Windows CI](https://github.com/hpgit/hpharnessv2/actions/runs/43324542962)에서 worker 테스트 정리 중 `owner.log`의 `WinError 32`가 발생했다. 작업 결과 기록 이후에도 detached owner가 종료하며 로그 handle을 잠시 유지하는 경쟁 조건이었다. 테스트는 실제 owner의 PID와 생성 식별자를 확인해 종료를 기다린 후 임시 디렉토리를 정리하도록 수정했다. 완료 기록을 먼저 발행하고 로그를 잡은 owner를 유지하는 회귀 테스트로 이전 정리 방식의 실패를 재현했다. 운영 worker의 완료 상태 의미나 CI 실패 처리 규칙은 변경하지 않았다.
+
 ## 실제 실행한 검증
 
 | 구성 | 검증 내용 |
