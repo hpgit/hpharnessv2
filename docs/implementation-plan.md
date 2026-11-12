@@ -96,7 +96,7 @@ Node.js·Python 미포함 환경의 설치 진단, 사내 mirror·registry·CA�
 | Confluence 지정 범위 확인 | 60분 간격, 화면 제어가 필요하면 대기 |
 | 메신저 수집 | 요청 시 우선, 대화방별 주기 수집은 명시적 설정 |
 | UI 초기 언어 | 한국어, 영어 전환 제공 |
-| 초기 테마 | Solarized Light, 다크·시스템 연동 선택 제공 |
+| 초기 테마 | 후속 UI 요청에 따라 중립 Light. Dark·Solarized Light 선택, 시스템 연동은 후속 구현 |
 | 임베딩 | 로컬 google/embeddinggemma-2, 텍스트·코드·이미지, 768차원 |
 | 설정 | YAML과 설정 화면, 사용자 → 프로젝트 → 세션 우선순위 |
 

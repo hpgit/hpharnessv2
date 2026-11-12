@@ -1,4 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod appearance;
+mod interface;
 mod rpc;
 mod state;
 mod terminal;
@@ -7,15 +9,34 @@ use eframe::egui::{self, Color32, RichText};
 use serde_json::{Value, json};
 use state::{Buffer, Preferences};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().collect();
+    let size = args
+        .iter()
+        .position(|s| s == "--smoke-size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.split_once('x'))
+        .and_then(|(w, h)| {
+            Some([
+                w.parse::<f32>().ok()?.clamp(850.0, 2560.0),
+                h.parse::<f32>().ok()?.clamp(600.0, 1600.0),
+            ])
+        })
+        .unwrap_or([1380.0, 900.0]);
     let options = eframe::NativeOptions {
+        persist_window: !args.iter().any(|arg| arg == "--smoke-report"),
+        persistence_path: args
+            .iter()
+            .position(|arg| arg == "--smoke-report")
+            .and_then(|i| args.get(i + 1))
+            .map(|path| PathBuf::from(path).with_extension("ui-state")),
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1380.0, 900.0])
+            .with_inner_size(size)
             .with_min_inner_size([850.0, 600.0]),
         ..Default::default()
     };
@@ -30,6 +51,7 @@ fn main() -> eframe::Result {
 enum Pending {
     Ping,
     Projects,
+    AllSessions,
     Sessions(String),
     Messages(String),
     Runs,
@@ -54,11 +76,16 @@ enum Pending {
 }
 
 struct HarnessApp {
+    markdown: egui_commonmark::CommonMarkCache,
+    sidebar_query: String,
+    search_open: bool,
+    collapsed_projects: HashSet<String>,
     client: rpc::Client,
     pending: HashMap<u64, Pending>,
     prefs: Preferences,
     projects: Vec<Value>,
     sessions: Vec<Value>,
+    all_sessions: Vec<Value>,
     messages: Vec<Value>,
     runs: Vec<Value>,
     approvals: Vec<Value>,
@@ -95,6 +122,7 @@ struct HarnessApp {
     last_poll: Instant,
     started: Instant,
     smoke_report: Option<PathBuf>,
+    smoke_chat: bool,
     screenshot_requested: bool,
     advanced_settings: String,
     lsp_command: String,
@@ -221,11 +249,16 @@ impl HarnessApp {
             .and_then(|i| args.get(i + 1))
             .map(|s| s.to_string_lossy().into_owned());
         let mut app = Self {
+            markdown: egui_commonmark::CommonMarkCache::default(),
+            sidebar_query: String::new(),
+            search_open: false,
             client: rpc::Client::launch(&root, cc.egui_ctx.clone()),
             pending: HashMap::new(),
             prefs,
             projects: vec![],
             sessions: vec![],
+            all_sessions: vec![],
+            collapsed_projects: HashSet::new(),
             messages: vec![],
             runs: vec![],
             approvals: vec![],
@@ -240,7 +273,7 @@ impl HarnessApp {
             status: "실행 서비스 연결 중…".into(),
             connected: false,
             left_tab: 0,
-            bottom_open: true,
+            bottom_open: args.iter().any(|arg| arg == "--smoke-panel"),
             bottom_tab: 0,
             settings_open: false,
             create_open: false,
@@ -283,6 +316,7 @@ impl HarnessApp {
             last_poll: Instant::now(),
             started: Instant::now(),
             smoke_report,
+            smoke_chat: args.iter().any(|a| a == "--smoke-chat"),
             screenshot_requested: false,
             smoke_scenario,
             smoke_phase: 0,
@@ -303,6 +337,7 @@ impl HarnessApp {
         }
         app.request("ping", json!({}), Pending::Ping);
         app.request("projects.list", json!({}), Pending::Projects);
+        app.request("sessions.list", json!({}), Pending::AllSessions);
         app.request("settings.get", json!({}), Pending::Settings);
         app.request("lsp.catalog", json!({}), Pending::LspCatalog);
         app.buffers = cc
@@ -312,6 +347,13 @@ impl HarnessApp {
         if app.smoke_report.is_some() {
             app.buffers.clear();
             app.prefs = Preferences::default();
+        }
+        if args.iter().any(|a| a == "--smoke-dark") {
+            app.prefs.dark = true;
+        }
+        if args.iter().any(|a| a == "--smoke-solarized") {
+            app.prefs.dark = false;
+            app.prefs.solarized = true;
         }
         app
     }
@@ -333,6 +375,7 @@ impl HarnessApp {
         self.prefs.edit_mode = *self.prefs.project_modes.get(&id).unwrap_or(&false);
         self.prefs.selected_project = id.clone();
         self.prefs.selected_session.clear();
+        self.sessions.clear();
         self.messages.clear();
         self.files.clear();
         self.request(
@@ -344,6 +387,8 @@ impl HarnessApp {
     fn select_session(&mut self, id: String) {
         self.prefs.selected_session = id.clone();
         self.file_dir.clear();
+        self.files.clear();
+        self.preview_open = false;
         self.messages.clear();
         self.request(
             "messages.list",
@@ -353,6 +398,9 @@ impl HarnessApp {
         self.request("files.list", json!({"sessionId":id}), Pending::Files(id));
     }
     fn refresh(&mut self) {
+        if self.search_open {
+            self.request("sessions.list", json!({}), Pending::AllSessions);
+        }
         if !self.prefs.selected_session.is_empty() {
             self.request(
                 "messages.list",
@@ -414,12 +462,21 @@ impl HarnessApp {
                                 self.select_project(id);
                             }
                         }
+                        Pending::AllSessions => self.all_sessions = array(result),
                         Pending::Sessions(project) => {
                             if project != self.prefs.selected_project {
                                 continue;
                             }
                             self.sessions = array(result);
-                            if let Some(s) = self.sessions.first() {
+                            self.all_sessions
+                                .retain(|s| text(s, "projectId") != project);
+                            self.all_sessions.extend(self.sessions.clone());
+                            if !self
+                                .sessions
+                                .iter()
+                                .any(|s| text(s, "id") == self.prefs.selected_session)
+                                && let Some(s) = self.sessions.first()
+                            {
                                 self.select_session(text(s, "id").into());
                             }
                         }
@@ -580,51 +637,10 @@ impl HarnessApp {
             }
         }
     }
-    fn visuals(&self, ctx: &egui::Context) {
-        let mut visuals = if self.prefs.dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        };
-        if !self.prefs.dark {
-            visuals.panel_fill = Color32::from_rgb(253, 246, 227);
-            visuals.window_fill = visuals.panel_fill;
-            visuals.extreme_bg_color = Color32::from_rgb(238, 232, 213);
-            visuals.faint_bg_color = Color32::from_rgb(244, 237, 218);
-            visuals.override_text_color = Some(Color32::from_rgb(67, 89, 96));
-            visuals.selection.bg_fill = Color32::from_rgb(221, 215, 194);
-            visuals.selection.stroke.color = Color32::from_rgb(7, 54, 66);
-            visuals.widgets.inactive.bg_fill = Color32::from_rgb(238, 232, 213);
-            visuals.widgets.hovered.bg_fill = Color32::from_rgb(225, 219, 198);
-        }
-        ctx.set_visuals(visuals);
-        ctx.style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            style.spacing.button_padding = egui::vec2(10.0, 6.0);
-            style.spacing.interact_size.y = 30.0;
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
-            style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
-            style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
-            style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
-            style.visuals.selection.bg_fill = Color32::from_rgb(206, 226, 225);
-        });
-    }
     fn save_buffer(&mut self) {
-        if let Some(buffer) = self.buffers.get(self.active_buffer) {
+        if let Some(buffer) = self.buffers.get(self.active_buffer)
+            && buffer.session == self.prefs.selected_session
+        {
             self.request("files.write",json!({"sessionId":buffer.session,"path":buffer.path,"content":buffer.text,"baseVersion":buffer.version}),Pending::Save{index:self.active_buffer,submitted:buffer.text.clone()});
         }
     }
@@ -639,91 +655,34 @@ impl HarnessApp {
             Pending::RunStart(input.clone()),
         );
     }
-    fn chat(&mut self, ui: &mut egui::Ui) {
-        let input_height = 158.0;
-        egui::ScrollArea::vertical()
-            .id_salt("messages")
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            .max_height((ui.available_height() - input_height).max(100.0))
-            .min_scrolled_height((ui.available_height() - input_height).max(100.0))
-            .show(ui, |ui| {
-                if self.prefs.selected_session.is_empty() {
-                    ui.add_space(35.0);
-                    ui.heading("작업을 시작하세요");
-                    ui.label("프로젝트와 실행 디렉토리를 등록한 뒤 새 작업을 만드세요.");
-                }
-                for message in &self.messages {
-                    ui.add_space(12.0);
-                    let content = message
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| message["content"].to_string());
-                    let user = text(message, "role") == "user";
-                    let fill = if user {
-                        ui.visuals().faint_bg_color
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    egui::Frame::new()
-                        .fill(fill)
-                        .corner_radius(10)
-                        .inner_margin(12)
-                        .show(ui, |ui| {
-                            ui.set_width((ui.available_width() - 4.0).max(80.0));
-                            ui.label(
-                                RichText::new(match text(message, "role") {
-                                    "user" => "나",
-                                    "assistant" => "Harness",
-                                    "tool" => "도구 결과",
-                                    role => role,
-                                })
-                                .strong(),
-                            );
-                            ui.add(egui::Label::new(content).wrap().selectable(true));
-                        });
-                }
-                if let Some(run) = self
-                    .runs
-                    .iter()
-                    .find(|r| text(r, "sessionId") == self.prefs.selected_session)
-                {
-                    ui.label(format!("작업 상태: {}", text(run, "status")));
-                    if let Some(error) = run.get("error") {
-                        ui.colored_label(Color32::from_rgb(190, 60, 45), error.to_string());
-                    }
-                }
-            });
-        ui.add_space(6.0);
-        ui.add(
-            egui::TextEdit::multiline(&mut self.composer)
-                .desired_width(f32::INFINITY)
-                .desired_rows(3)
-                .min_size(egui::vec2(0.0, 90.0))
-                .hint_text("작업 요청 · 실행 중에는 다음 요청으로 예약"),
-        );
-        ui.horizontal(|ui| {
-            ui.label(format!("{} · {}", self.protocol, self.model));
-            if ui
-                .add_enabled(
-                    self.connected && !self.prefs.selected_session.is_empty(),
-                    egui::Button::new("보내기"),
-                )
-                .clicked()
-            {
-                self.send_message();
-            }
-        });
-    }
     fn editor(&mut self, ui: &mut egui::Ui) {
-        if self.buffers.is_empty() {
+        if !self
+            .buffers
+            .get(self.active_buffer)
+            .is_some_and(|b| b.session == self.prefs.selected_session)
+            && let Some(index) = self
+                .buffers
+                .iter()
+                .position(|b| b.session == self.prefs.selected_session)
+        {
+            self.active_buffer = index;
+        }
+        if !self
+            .buffers
+            .get(self.active_buffer)
+            .is_some_and(|b| b.session == self.prefs.selected_session)
+        {
             ui.heading("편집기");
             ui.label("왼쪽 파일 목록에서 파일을 여세요. 편집 버퍼는 작업 전환 중에도 보존됩니다.");
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            for (index, buffer) in self.buffers.iter().enumerate() {
+            for (index, buffer) in self
+                .buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.session == self.prefs.selected_session)
+            {
                 let title = format!(
                     "{}{}",
                     PathBuf::from(&buffer.path)
@@ -740,29 +699,31 @@ impl HarnessApp {
                 }
             }
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("저장  Ctrl+S").clicked() {
                 self.save_buffer();
             }
             ui.checkbox(&mut self.prefs.split_editor, "원본과 분할");
-        });
-        ui.horizontal(|ui| {
-            for (method, label) in [
-                ("completion", "자동완성"),
-                ("definition", "정의"),
-                ("references", "참조"),
-                ("diagnostics", "진단"),
-            ] {
-                if ui
-                    .add_enabled(self.lsp_ready, egui::Button::new(label))
-                    .clicked()
-                {
-                    self.lsp_action(method);
+            ui.menu_button("코드 탐색", |ui| {
+                for (method, label) in [
+                    ("completion", "자동완성"),
+                    ("definition", "정의"),
+                    ("references", "참조"),
+                    ("diagnostics", "진단"),
+                ] {
+                    if ui
+                        .add_enabled(self.lsp_ready, egui::Button::new(label))
+                        .clicked()
+                    {
+                        self.lsp_action(method);
+                        ui.close();
+                    }
                 }
-            }
-            if !self.lsp_ready && ui.button("언어 서버 연결").clicked() {
-                self.settings_open = true;
-            }
+                if !self.lsp_ready && ui.button("언어 서버 연결").clicked() {
+                    self.settings_open = true;
+                    ui.close();
+                }
+            });
         });
         let buffer = &mut self.buffers[self.active_buffer];
         ui.label(RichText::new(&buffer.path).small());
@@ -809,141 +770,8 @@ impl HarnessApp {
             self.editor_cursor = cursor;
         }
     }
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        ui.heading("Harness");
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.left_tab, 0, "작업");
-            ui.selectable_value(&mut self.left_tab, 1, "파일");
-        });
-        if self.left_tab == 0 {
-            if ui.button("＋ 프로젝트").clicked() {
-                self.create_open = true;
-            }
-            let projects = self.projects.clone();
-            for project in projects {
-                let id = text(&project, "id").to_owned();
-                if ui
-                    .selectable_label(self.prefs.selected_project == id, text(&project, "name"))
-                    .clicked()
-                {
-                    self.select_project(id);
-                }
-            }
-            ui.separator();
-            if ui
-                .add_enabled(
-                    !self.prefs.selected_project.is_empty(),
-                    egui::Button::new("＋ 새 작업"),
-                )
-                .clicked()
-            {
-                if let Some(project) = self
-                    .projects
-                    .iter()
-                    .find(|p| text(p, "id") == self.prefs.selected_project)
-                {
-                    self.new_root = text(project, "root").into();
-                    self.remote = text(&project["target"], "kind") == "ssh";
-                    self.new_host = text(&project["target"], "host").into();
-                    self.new_container = text(&project["target"], "container").into();
-                }
-                self.new_session_open = true;
-            }
-            let sessions = self.sessions.clone();
-            for session in sessions {
-                let id = text(&session, "id").to_owned();
-                if ui
-                    .selectable_label(self.prefs.selected_session == id, text(&session, "title"))
-                    .clicked()
-                {
-                    self.select_session(id);
-                }
-            }
-        } else {
-            ui.label(
-                RichText::new(if self.file_dir.is_empty() {
-                    "기준 디렉토리"
-                } else {
-                    &self.file_dir
-                })
-                .small(),
-            );
-            if ui.button("상위 폴더").clicked() {
-                let parent = self
-                    .file_dir
-                    .trim_end_matches('/')
-                    .rsplit_once('/')
-                    .map(|(p, _)| p)
-                    .unwrap_or("")
-                    .to_owned();
-                self.file_dir = parent.clone();
-                self.request(
-                    "files.list",
-                    json!({"sessionId":self.prefs.selected_session,"path":parent}),
-                    Pending::Files(self.prefs.selected_session.clone()),
-                );
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("files")
-                .show(ui, |ui| {
-                    let files = self.files.clone();
-                    for file in files {
-                        let directory = file["isDirectory"].as_bool().unwrap_or(false);
-                        let path = text(&file, "path").to_owned();
-                        if ui
-                            .button(format!(
-                                "{} {}",
-                                if directory { "▸" } else { "·" },
-                                text(&file, "name")
-                            ))
-                            .clicked()
-                        {
-                            if directory {
-                                self.file_dir = path.clone();
-                                self.request(
-                                    "files.list",
-                                    json!({"sessionId":self.prefs.selected_session,"path":path}),
-                                    Pending::Files(self.prefs.selected_session.clone()),
-                                );
-                            } else if ["png","jpg","jpeg","gif","webp"].contains(&PathBuf::from(&path).extension().unwrap_or_default().to_string_lossy().to_lowercase().as_str()) {
-                                self.request("files.preview",json!({"sessionId":self.prefs.selected_session,"path":path}),Pending::Preview);
-                            } else if ["docx","xlsx","pptx","pdf","doc","xls","ppt"].contains(&PathBuf::from(&path).extension().unwrap_or_default().to_string_lossy().to_lowercase().as_str()) {
-                                self.preview_open=true;self.preview_image=None;self.preview_note="Office·PDF 문서 미리보기는 아직 연결되지 않았습니다. DRM 문서는 사내 Office 환경의 검증이 필요합니다.".into();
-                            } else {
-                                self.request(
-                                    "files.read",
-                                    json!({"sessionId":self.prefs.selected_session,"path":path}),
-                                    Pending::Read(self.prefs.selected_session.clone()),
-                                );
-                            }
-                        }
-                    }
-                });
-        }
-        ui.separator();
-        if ui.button("기억 관리").clicked() {
-            self.memory_open = true;
-            self.request(
-                "memory.list",
-                json!({"projectId":self.prefs.selected_project}),
-                Pending::Memory,
-            );
-        }
-        if ui
-            .button(format!("응답 필요 · {}", self.approvals.len()))
-            .clicked()
-        {
-            self.bottom_open = true;
-            self.bottom_tab = 1;
-        }
-        if ui.button("설정 · Core 교체").clicked() {
-            self.settings_open = true;
-        }
-    }
     fn bottom(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.bottom_tab, 0, "명령 실행");
             ui.selectable_value(&mut self.bottom_tab, 1, "승인");
             ui.selectable_value(&mut self.bottom_tab, 2, "실행 작업");
@@ -1432,7 +1260,12 @@ impl HarnessApp {
         if self.settings_open {
             let mut open = true;
             egui::Window::new("설정").open(&mut open).default_width(600.0).vscroll(true).show(ctx,|ui|{
-                ui.checkbox(&mut self.prefs.dark,"다크 테마");ui.separator();ui.heading("모델 연결");
+                ui.heading("화면 테마");
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!self.prefs.dark && !self.prefs.solarized,"Codex Light").clicked(){self.prefs.dark=false;self.prefs.solarized=false;}
+                    if ui.selectable_label(self.prefs.dark,"Dark").clicked(){self.prefs.dark=true;self.prefs.solarized=false;}
+                    if ui.selectable_label(!self.prefs.dark && self.prefs.solarized,"Solarized Light").clicked(){self.prefs.dark=false;self.prefs.solarized=true;}
+                });ui.separator();ui.heading("모델 연결");
                 egui::ComboBox::from_label("프로토콜").selected_text(&self.protocol).show_ui(ui,|ui|{for protocol in ["responses","chat-completions","anthropic"]{ui.selectable_value(&mut self.protocol,protocol.into(),protocol);}});
                 ui.label("API base URL");ui.text_edit_singleline(&mut self.endpoint);ui.label("모델");ui.text_edit_singleline(&mut self.model);
                 ui.label("API key 파일 경로 (선택, 비밀값은 화면에 표시하지 않음)");ui.text_edit_singleline(&mut self.key_path);
@@ -1563,6 +1396,10 @@ impl eframe::App for HarnessApp {
             }
         }
         self.visuals(ctx);
+        if self.smoke_report.is_some() && self.smoke_chat {
+            self.prefs.edit_mode = false;
+            self.left_tab = 0;
+        }
         if self.connected
             && self.last_poll.elapsed() > Duration::from_secs(2)
             && self.pending.len() < 8
@@ -1579,80 +1416,99 @@ impl eframe::App for HarnessApp {
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space)) {
             self.lsp_action("completion");
         }
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(&self.status).small());
-                ui.separator();
-                if ui.selectable_label(self.bottom_open, "실행 패널").clicked() {
-                    self.bottom_open = !self.bottom_open;
-                }
-                ui.label(RichText::new("Rust native · Cordis").small());
+        let palette = appearance::palette(self.prefs.dark, self.prefs.solarized);
+        if !self.prefs.sidebar_collapsed {
+            egui::SidePanel::left("navigation-v2")
+                .default_width(248.0)
+                .width_range(210.0..=320.0)
+                .resizable(true)
+                .frame(
+                    egui::Frame::new()
+                        .fill(palette.sidebar)
+                        .inner_margin(egui::Margin::symmetric(12, 14)),
+                )
+                .show(ctx, |ui| self.sidebar(ui));
+        }
+        egui::TopBottomPanel::top("task-header-v2")
+            .exact_height(58.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.canvas)
+                    .inner_margin(egui::Margin::symmetric(22, 10)),
+            )
+            .show(ctx, |ui| self.header(ui));
+        egui::TopBottomPanel::bottom("workspace-status")
+            .exact_height(24.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.canvas)
+                    .inner_margin(egui::Margin::symmetric(20, 3)),
+            )
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(&self.status).small().color(palette.muted))
+                        .truncate(),
+                )
+                .on_hover_text(&self.status);
             });
-        });
-        egui::SidePanel::left("sidebar")
-            .default_width(210.0)
-            .width_range(160.0..=320.0)
-            .resizable(true)
-            .show(ctx, |ui| self.sidebar(ui));
-        egui::TopBottomPanel::top("taskbar").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.heading(
-                    self.sessions
-                        .iter()
-                        .find(|s| text(s, "id") == self.prefs.selected_session)
-                        .map(|s| text(s, "title"))
-                        .unwrap_or("작업 공간"),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.selectable_label(self.prefs.edit_mode, "편집").clicked() {
-                        self.prefs.edit_mode = true;
-                        self.left_tab = 1;
-                    }
-                    if ui.selectable_label(!self.prefs.edit_mode, "대화").clicked() {
-                        self.prefs.edit_mode = false;
-                        self.left_tab = 0;
-                    }
-                });
-            });
-            if let Some(session) = self
-                .sessions
-                .iter()
-                .find(|s| text(s, "id") == self.prefs.selected_session)
-            {
-                let target = &session["target"];
-                ui.label(format!(
-                    "{} {} {}   ·   {}",
-                    text(target, "kind"),
-                    text(target, "host"),
-                    text(target, "container"),
-                    text(session, "cwd")
-                ));
-            }
-            ui.add_space(6.0);
-        });
         if self.bottom_open {
+            let max_height = (ctx.available_rect().height() - 300.0).clamp(110.0, 400.0);
             egui::TopBottomPanel::bottom("execution")
                 .resizable(true)
-                .default_height(180.0)
-                .height_range(90.0..=400.0)
+                .default_height(230.0_f32.min(max_height))
+                .height_range(110.0..=max_height)
+                .frame(
+                    egui::Frame::new()
+                        .fill(palette.canvas)
+                        .stroke(egui::Stroke::new(1.0_f32, palette.border))
+                        .inner_margin(12),
+                )
                 .show(ctx, |ui| self.bottom(ui));
         }
+        let wide = ctx.available_rect().width() >= 880.0;
         if self.prefs.edit_mode {
-            egui::SidePanel::right("chat-pane")
-                .resizable(true)
-                .default_width(380.0)
-                .width_range(280.0..=700.0)
-                .show(ctx, |ui| self.chat(ui));
-            egui::CentralPanel::default().show(ctx, |ui| self.editor(ui));
-        } else {
-            if !self.buffers.is_empty() {
-                egui::SidePanel::right("preview-pane")
+            if wide {
+                egui::SidePanel::right("chat-pane-v2")
                     .resizable(true)
-                    .default_width(400.0)
+                    .default_width(380.0)
+                    .width_range(320.0..=550.0)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(palette.canvas)
+                            .stroke(egui::Stroke::new(1.0_f32, palette.border))
+                            .inner_margin(8),
+                    )
+                    .show(ctx, |ui| self.chat(ui));
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(palette.canvas).inner_margin(16))
+                .show(ctx, |ui| self.editor(ui));
+        } else {
+            if self.prefs.show_preview
+                && self
+                    .buffers
+                    .iter()
+                    .any(|b| b.session == self.prefs.selected_session)
+                && wide
+            {
+                egui::SidePanel::right("preview-pane-v2")
+                    .resizable(true)
+                    .default_width(420.0)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(palette.canvas)
+                            .stroke(egui::Stroke::new(1.0_f32, palette.border))
+                            .inner_margin(12),
+                    )
                     .show(ctx, |ui| self.editor(ui));
             }
-            egui::CentralPanel::default().show(ctx, |ui| self.chat(ui));
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(palette.canvas)
+                        .inner_margin(egui::Margin::symmetric(8, 12)),
+                )
+                .show(ctx, |ui| self.chat(ui));
         }
         self.windows(ctx);
         ctx.request_repaint_after(Duration::from_millis(250));

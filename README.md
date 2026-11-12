@@ -23,7 +23,7 @@ GUI에서 프로젝트 이름과 절대 경로를 등록하고 세션을 만드�
 
 | 경로 | 역할 |
 | --- | --- |
-| `crates/desktop` | Rust 창, Solarized Light, 한국어, 대화·편집·LSP·PTY·Git·승인·기억·설정 |
+| `crates/desktop` | Rust 창, Codex 스타일 대화·프로젝트 탐색, Light/Dark/Solarized, 편집·LSP·PTY·Git·승인·기억·설정 |
 | `packages/harness` | Cordis 실행 세대, 판단 함수 교체, SQLite 기록, 작업 큐, 승인·자기 개선, daemon |
 | `packages/providers` | 세 모델 API, 도구 결과 변환, 취소·proxy·CA |
 | `packages/extensions` | LSP·MCP stdio, 브라우저 정책, 원문 보관·검색, 공유 자산, Git |
@@ -31,6 +31,8 @@ GUI에서 프로젝트 이름과 절대 경로를 등록하고 세션을 만드�
 | `browser-extension`, `crates/browser-bridge` | Chrome 확장프로그램과 Rust Native Messaging bridge |
 
 렌더링과 UI 로직은 Rust이며 웹뷰를 사용하지 않습니다. GPUI 후보 대신 Windows 빌드·실행을 검증한 eframe을 채택했습니다.
+
+화면은 Codex Desktop의 구성을 참고해 프로젝트·작업 사이드바, 가운데 대화와 입력창, 간결한 상단 바를 사용합니다. 중립적인 Light가 기본이며 설정에서 Dark 또는 Solarized Light를 선택할 수 있습니다. 답변은 Markdown으로 표시하고 도구 결과는 펼쳐서 확인합니다. 실행 패널은 처음에는 접혀 있으며 상단 터미널 버튼으로 엽니다. `대화 / 편집`으로 배치를 전환합니다. [화면 구성](docs/ui-design.md).
 
 ## 편집·원격 실행
 

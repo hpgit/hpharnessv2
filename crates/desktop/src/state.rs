@@ -2,9 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Preferences {
     pub edit_mode: bool,
     pub dark: bool,
+    pub solarized: bool,
+    pub sidebar_collapsed: bool,
+    pub show_preview: bool,
     pub split_editor: bool,
     pub project_modes: BTreeMap<String, bool>,
     pub selected_project: String,
