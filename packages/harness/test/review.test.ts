@@ -16,27 +16,41 @@ async function fixture(invoke: ModelInvoke = async () => ({ text: "done" })) {
     async close() { await h.close(); await fs.rm(root, { recursive: true, force: true }); },
   };
 }
+// Keep polling on real time when a test controls the harness's duration timer.
+const pollTimeout = globalThis.setTimeout;
 async function until(check: () => boolean) {
   for (let i = 0; i < 500; i++) {
     if (check()) return;
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => pollTimeout(r, 10));
   }
   throw new Error("condition timed out");
 }
 const writes = () => ["one", "two"].map((id) => ({ id, name: "files_write", arguments: { path: id + ".txt", content: id, baseVersion: null } }));
 
-for (const duration of [false, true]) test(`review: ${duration ? "duration" : "explicit"} cancellation drains approvals and queued run`, async () => {
+for (const duration of [false, true]) test(`review: ${duration ? "duration" : "explicit"} cancellation drains approvals and queued run`, async (t) => {
   let steps = 0;
-  const f = await fixture(async () => ++steps === 1 ? { text: "", toolCalls: writes() } : { text: "next completed" });
+  const f = await fixture(async () => {
+    if (++steps === 1) return { text: "", toolCalls: writes() };
+    // Exercise a successor slower than the old 100 ms wall-clock assumption.
+    if (duration) await new Promise((r) => pollTimeout(r, 150));
+    return { text: "next completed" };
+  });
   try {
     await f.h.rpc("settings.update", { maxAgents: 1, ...(duration ? { maxDurationMs: 100 } : {}) });
+    if (duration) t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
     const first = await f.h.rpc("runs.start", { sessionId: f.session.id, input: "first" });
     const second = await f.h.rpc("runs.start", { sessionId: f.session.id, input: "second" });
     await until(() => f.h.store.list<any>("approval").some((a) => a.status === "pending"));
-    if (!duration) await f.h.rpc("runs.cancel", { runId: first.id });
-    await f.h.waitForIdle();
+    assert.equal((await f.h.rpc("runs.status", { runId: second.id })).status, "queued");
+    // Expire only the first run, after it actually reaches approval. Leave the
+    // second run's clock still so slow CI disk I/O cannot cancel it as well.
+    if (duration) t.mock.timers.tick(100);
+    else await f.h.rpc("runs.cancel", { runId: first.id });
+    await until(() => [first.id, second.id].every((id) =>
+      ["completed", "cancelled", "failed"].includes(f.h.store.get<any>("run", id)!.status)));
     assert.equal((await f.h.rpc("runs.status", { runId: first.id })).status, "cancelled");
     const cancelled = await f.h.rpc("runs.status", { runId: first.id });
+    if (duration) assert.equal(cancelled.error, "Configured duration limit reached");
     assert.deepEqual(await f.h.rpc("runs.cancel", { runId: first.id }), cancelled);
     assert.equal((await f.h.rpc("runs.status", { runId: second.id })).status, "completed");
     assert.equal(f.h.store.list<any>("approval").filter((a) => a.status === "pending").length, 0);
@@ -44,7 +58,7 @@ for (const duration of [false, true]) test(`review: ${duration ? "duration" : "e
     const completed = await f.h.rpc("runs.cancel", { runId: second.id });
     assert.equal(completed.status, "completed");
     assert.deepEqual(await f.h.rpc("runs.cancel", { runId: second.id }), completed);
-  } finally { await f.close(); }
+  } finally { t.mock.timers.reset(); await f.close(); }
 });
 
 test("review: cancelling a failed run preserves its terminal error", async () => {
