@@ -42,7 +42,10 @@ class OutlookContracts(unittest.TestCase):
         item = SimpleNamespace(Attachments=SimpleNamespace(Item=lambda _: attachment))
         client = SimpleNamespace(Dispatch=lambda _: SimpleNamespace(GetNamespace=lambda _: SimpleNamespace(GetItemFromID=lambda _: item)))
         with tempfile.TemporaryDirectory() as root:
-            knowledge = Path(root) / 'knowledge'
+            # Exercise a noncanonical root on every OS. Windows CI can also
+            # supply short-name TEMP paths that Worker.resolve() expands.
+            (Path(root) / 'alias').mkdir()
+            knowledge = Path(root) / 'alias' / '..' / 'knowledge'
             worker = Worker(root, Path(root) / 'state', knowledge)
             (knowledge / 'existing.json').write_bytes(b'12345')
             with patch.object(worker, 'com', return_value=client):
@@ -50,5 +53,7 @@ class OutlookContracts(unittest.TestCase):
                     worker.dispatch('outlook.attachment', {'entry_id': 'message', 'index': 1, 'output': 'a.txt', 'quota_bytes': 10})
                 self.assertEqual(caught.exception.code, 'QUOTA_EXCEEDED')
                 result = worker.dispatch('outlook.attachment', {'entry_id': 'message', 'index': 1, 'output': 'a.txt', 'quota_bytes': 11})
-            self.assertTrue(Path(result['path']).is_relative_to(knowledge))
+            destination = Path(result['path'])
+            self.assertEqual(destination, (knowledge / 'mail-attachments' / 'a.txt').resolve())
+            self.assertEqual(destination.read_bytes(), b'123456')
             self.assertEqual(result['quota_scope'], 'shared_knowledge_root')

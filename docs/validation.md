@@ -6,6 +6,8 @@
 
 최종 실행 결과: `npm run build` 성공, `npm test` 70개 중 64개 통과·6개 live skip, `cargo test --workspace` 16개 통과, desktop strict clippy 통과, workspace-local Python/uv cache를 사용한 worker unittest 29개 중 27개 통과·2개 skip. `git diff --check`도 통과했다. Python 잠금 해제 회귀 테스트는 실제 프로세스 종료를 확인한 뒤 Windows 커널의 잠금 반환을 최대 5초 기다리며, 기한을 넘으면 실패한다.
 
+후속 `52ac5e4`의 [CI 실행](https://github.com/hpgit/hpharnessv2/actions/runs/43336483594)은 Linux 성공, Windows의 Outlook quota 테스트 경로 비교에서 실패했다. worker는 저장 경로를 `resolve()`하지만 테스트는 정규화 전 임시 경로와 문자열 포함 관계를 비교했다. `alias/../knowledge` fixture로 같은 실패를 로컬에서 재현하고, 정규화한 정확한 첨부 경로 및 저장 바이트를 검증하도록 수정했다. quota 초과 거부와 정확한 한도에서의 성공 검증은 유지한다.
+
 | 지적 | 수정 및 현재 검증 범위 |
 | --- | --- |
 | 취소·시간 만료 후 승인 재생성 | 승인 생성 전과 각 도구 시작 전 abort 검사. 복수 승인, 후속 queued run, 취소 중 외부 작업이 끝날 때까지 같은 세션 배타성 유지 회귀 테스트 |
