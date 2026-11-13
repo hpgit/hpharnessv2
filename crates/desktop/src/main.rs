@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod appearance;
 mod interface;
+#[cfg(test)]
+mod regression_tests;
 mod rpc;
 mod state;
 mod terminal;
@@ -57,9 +59,10 @@ enum Pending {
     Runs,
     Approvals,
     Settings,
+    SettingsSaved,
     CreateProject,
     CreateSession,
-    Files(String),
+    Files(String, String),
     Read(String),
     RefreshRead(String, String),
     Save { index: usize, submitted: String },
@@ -187,6 +190,18 @@ fn workspace_root() -> PathBuf {
 
 impl HarnessApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_client(
+            &cc.egui_ctx,
+            cc.storage,
+            rpc::Client::launch(&workspace_root(), cc.egui_ctx.clone()),
+        )
+    }
+
+    fn with_client(
+        ctx: &egui::Context,
+        storage: Option<&dyn eframe::Storage>,
+        client: rpc::Client,
+    ) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         let font_path = std::env::var_os("HPH_FONT").map(PathBuf::from).or_else(|| {
             [
@@ -212,8 +227,8 @@ impl HarnessApp {
                     .push("korean".into());
             }
         }
-        cc.egui_ctx.set_fonts(fonts);
-        cc.egui_ctx.style_mut(|style| {
+        ctx.set_fonts(fonts);
+        ctx.style_mut(|style| {
             style.spacing.item_spacing = egui::vec2(8.0, 8.0);
             style.spacing.button_padding = egui::vec2(10.0, 6.0);
             style
@@ -229,8 +244,7 @@ impl HarnessApp {
                 .text_styles
                 .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
         });
-        let prefs = cc
-            .storage
+        let prefs = storage
             .and_then(|s| eframe::get_value(s, "preferences"))
             .unwrap_or_default();
         let root = workspace_root();
@@ -254,7 +268,7 @@ impl HarnessApp {
             markdown: egui_commonmark::CommonMarkCache::default(),
             sidebar_query: String::new(),
             search_open: false,
-            client: rpc::Client::launch(&root, cc.egui_ctx.clone()),
+            client,
             pending: HashMap::new(),
             prefs,
             projects: vec![],
@@ -331,19 +345,18 @@ impl HarnessApp {
             preview_note: String::new(),
             smoke_preview,
         };
-        let managed_pyright =
-            root.join(".tools/languages/node_modules/pyright/langserver.index.js");
-        if managed_pyright.exists() {
-            app.lsp_command = std::env::var("HPH_NODE").unwrap_or_else(|_| "node".into());
-            app.lsp_args = json!([managed_pyright.to_string_lossy(), "--stdio"]).to_string();
-        }
+        (app.lsp_command, app.lsp_args) = state::language_server(
+            &json!({"id":"pyright","command":"pyright-langserver","args":["--stdio"]}),
+            &root,
+            &std::env::var("HPH_NODE").unwrap_or_else(|_| "node".into()),
+            true,
+        );
         app.request("ping", json!({}), Pending::Ping);
         app.request("projects.list", json!({}), Pending::Projects);
         app.request("sessions.list", json!({}), Pending::AllSessions);
         app.request("settings.get", json!({}), Pending::Settings);
         app.request("lsp.catalog", json!({}), Pending::LspCatalog);
-        app.buffers = cc
-            .storage
+        app.buffers = storage
             .and_then(|s| eframe::get_value(s, "buffers"))
             .unwrap_or_default();
         if app.smoke_report.is_some() {
@@ -358,6 +371,117 @@ impl HarnessApp {
             app.prefs.solarized = true;
         }
         app
+    }
+
+    fn apply_settings(&mut self, mut value: Value) {
+        if let Some(settings) = value.as_object_mut() {
+            settings.remove("configPath");
+            settings.remove("configError");
+        }
+        let provider = &value["provider"];
+        self.protocol = provider["protocol"].as_str().unwrap_or("responses").into();
+        self.endpoint = provider["baseUrl"]
+            .as_str()
+            .unwrap_or("http://localhost:10100/v1")
+            .into();
+        self.model = provider["model"].as_str().unwrap_or("gpt-6-luna").into();
+        self.key_path = provider["apiKeyPath"]
+            .as_str()
+            .or_else(|| provider["apiKeyFile"].as_str())
+            .unwrap_or("")
+            .into();
+        self.advanced_settings = serde_json::to_string_pretty(&value).unwrap_or_default();
+        self.settings = value;
+    }
+
+    fn save_connection_settings(&mut self) {
+        let mut settings = self.settings.clone();
+        settings["provider"] =
+            json!({"protocol":self.protocol,"baseUrl":self.endpoint,"model":self.model});
+        if !self.key_path.is_empty() {
+            settings["provider"]["apiKeyPath"] = json!(self.key_path);
+        }
+        self.request("settings.update", settings, Pending::SettingsSaved);
+    }
+
+    fn save_advanced_settings(&mut self) {
+        match serde_json::from_str::<Value>(&self.advanced_settings) {
+            Ok(value) => self.request("settings.update", value, Pending::SettingsSaved),
+            Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn same_file(&self, session: &str, a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        let Some(s) = self
+            .sessions
+            .iter()
+            .chain(&self.all_sessions)
+            .find(|s| text(s, "id") == session)
+        else {
+            return false;
+        };
+        let remote = text(&s["target"], "kind") == "ssh";
+        state::file_key(text(s, "cwd"), a, remote) == state::file_key(text(s, "cwd"), b, remote)
+    }
+
+    fn buffer_index(&self, session: &str, path: &str) -> Option<usize> {
+        self.buffers
+            .iter()
+            .position(|b| b.session == session && self.same_file(session, &b.path, path))
+    }
+
+    fn refresh_files(&mut self) {
+        let session = self.prefs.selected_session.clone();
+        let directory = self.file_dir.clone();
+        if session.is_empty()
+            || self
+                .pending
+                .values()
+                .any(|p| matches!(p, Pending::Files(s,d) if s == &session && d == &directory))
+        {
+            return;
+        }
+        self.request(
+            "files.list",
+            json!({"sessionId":session,"path":directory}),
+            Pending::Files(session, directory),
+        );
+    }
+
+    fn select_lsp_preset(&mut self, server: &Value) {
+        let local = self
+            .sessions
+            .iter()
+            .find(|s| text(s, "id") == self.prefs.selected_session)
+            .is_none_or(|s| text(&s["target"], "kind") == "local");
+        (self.lsp_command, self.lsp_args) = state::language_server(
+            server,
+            &workspace_root(),
+            &std::env::var("HPH_NODE").unwrap_or_else(|_| "node".into()),
+            local,
+        );
+    }
+
+    fn resolve_conflict(&mut self, use_disk: bool, ctx: &egui::Context) {
+        let Some(buffer) = self.buffers.get_mut(self.active_buffer) else {
+            return;
+        };
+        if buffer.external.is_none() {
+            return;
+        }
+        if use_disk {
+            ctx.copy_text(buffer.text.clone());
+        }
+        buffer.resolve_external(use_disk);
+        self.status = if use_disk {
+            "충돌 해소: 편집 내용을 복사하고 디스크 내용을 불러왔습니다."
+        } else {
+            "충돌 해소: 내 편집을 유지했습니다. 저장하여 적용하세요."
+        }
+        .into();
     }
 
     fn request(&mut self, method: &str, params: Value, pending: Pending) {
@@ -397,9 +521,12 @@ impl HarnessApp {
             json!({"sessionId":id}),
             Pending::Messages(id.clone()),
         );
-        self.request("files.list", json!({"sessionId":id}), Pending::Files(id));
+        self.refresh_files();
     }
     fn refresh(&mut self) {
+        if self.left_tab == 1 && !self.prefs.sidebar_collapsed {
+            self.refresh_files();
+        }
         let open_files: Vec<_> = self
             .buffers
             .iter()
@@ -499,27 +626,10 @@ impl HarnessApp {
                         }
                         Pending::Runs => self.runs = array(result),
                         Pending::Approvals => self.approvals = array(result),
-                        Pending::Settings => {
-                            let mut result = result;
-                            if let Some(settings) = result.as_object_mut() {
-                                settings.remove("configPath");
-                                settings.remove("configError");
-                            }
-                            let p = &result["provider"];
-                            self.protocol = p["protocol"].as_str().unwrap_or("responses").into();
-                            self.endpoint = p["baseUrl"]
-                                .as_str()
-                                .unwrap_or("http://localhost:10100/v1")
-                                .into();
-                            self.model = p["model"].as_str().unwrap_or("gpt-6-luna").into();
-                            self.key_path = p["apiKeyPath"]
-                                .as_str()
-                                .or_else(|| p["apiKeyFile"].as_str())
-                                .unwrap_or("")
-                                .into();
-                            self.advanced_settings =
-                                serde_json::to_string_pretty(&result).unwrap_or_default();
-                            self.settings = result;
+                        Pending::Settings => self.apply_settings(result),
+                        Pending::SettingsSaved => {
+                            self.apply_settings(result);
+                            self.status = "설정 저장: 완료".into();
                         }
                         Pending::CreateProject => {
                             let id = text(&result, "id").to_owned();
@@ -540,19 +650,16 @@ impl HarnessApp {
                                 self.smoke_phase = 2;
                             }
                         }
-                        Pending::Files(session) => {
-                            if session == self.prefs.selected_session {
+                        Pending::Files(session, directory) => {
+                            if session == self.prefs.selected_session && directory == self.file_dir
+                            {
                                 self.files = array(result);
                             }
                         }
                         Pending::RefreshRead(session, _) => {
                             let path = text(&result, "path");
-                            if let Some(buffer) = self
-                                .buffers
-                                .iter_mut()
-                                .find(|b| b.path == path && b.session == session)
-                            {
-                                buffer.reload(
+                            if let Some(index) = self.buffer_index(&session, path) {
+                                self.buffers[index].reload(
                                     text(&result, "content").into(),
                                     text(&result, "version").into(),
                                 );
@@ -562,11 +669,11 @@ impl HarnessApp {
                             let path = text(&result, "path").to_owned();
                             let content = text(&result, "content").to_owned();
                             let version = text(&result, "version").to_owned();
-                            if let Some(index) = self
-                                .buffers
-                                .iter()
-                                .position(|b| b.path == path && b.session == session)
-                            {
+                            let navigating = self.goto.as_ref().is_some_and(|(target, _, _)| {
+                                session == self.lsp_session
+                                    && self.same_file(&session, target, &path)
+                            });
+                            if let Some(index) = self.buffer_index(&session, &path) {
                                 self.buffers[index].reload(content, version);
                                 self.active_buffer = index;
                             } else {
@@ -581,6 +688,9 @@ impl HarnessApp {
                                 });
                                 self.active_buffer = self.buffers.len() - 1;
                             }
+                            if navigating && let Some((target, _, _)) = &mut self.goto {
+                                *target = self.buffers[self.active_buffer].path.clone();
+                            }
                             self.prefs.edit_mode = true;
                         }
                         Pending::Save { index, submitted } => {
@@ -590,6 +700,7 @@ impl HarnessApp {
                             self.status = "저장 완료".into();
                         }
                         Pending::Command => {
+                            self.status = state::command_status(&result);
                             self.terminal.push_str(
                                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
                             );
@@ -763,22 +874,22 @@ impl HarnessApp {
                 }
             });
         });
-        let buffer = &mut self.buffers[self.active_buffer];
+        let buffer = &self.buffers[self.active_buffer];
         ui.label(RichText::new(&buffer.path).small());
         if let Some(conflict) = &buffer.conflict {
             ui.colored_label(Color32::from_rgb(190, 60, 45), conflict);
             if buffer.external.is_some() {
                 ui.horizontal(|ui| {
                     if ui.button("내 편집 유지 · 최신 원본에 적용").clicked() {
-                        buffer.resolve_external(false);
+                        self.resolve_conflict(false, ui.ctx());
                     }
                     if ui.button("내 편집 복사 후 디스크 내용 사용").clicked() {
-                        ui.ctx().copy_text(buffer.text.clone());
-                        buffer.resolve_external(true);
+                        self.resolve_conflict(true, ui.ctx());
                     }
                 });
             }
         }
+        let buffer = &mut self.buffers[self.active_buffer];
         let extension = PathBuf::from(&buffer.path)
             .extension()
             .unwrap_or_default()
@@ -1323,14 +1434,17 @@ impl HarnessApp {
                     if ui.selectable_label(self.prefs.dark,"Dark").clicked(){self.prefs.dark=true;self.prefs.solarized=false;}
                     if ui.selectable_label(!self.prefs.dark && self.prefs.solarized,"Solarized Light").clicked(){self.prefs.dark=false;self.prefs.solarized=true;}
                 });ui.separator();ui.heading("모델 연결");
+                let saving = self.pending.values().any(|p| matches!(p, Pending::Settings | Pending::SettingsSaved));
+                ui.add_enabled_ui(!saving, |ui| {
                 egui::ComboBox::from_label("프로토콜").selected_text(&self.protocol).show_ui(ui,|ui|{for protocol in ["responses","chat-completions","anthropic"]{ui.selectable_value(&mut self.protocol,protocol.into(),protocol);}});
                 ui.label("API base URL");ui.text_edit_singleline(&mut self.endpoint);ui.label("모델");ui.text_edit_singleline(&mut self.model);
                 ui.label("API key 파일 경로 (선택, 비밀값은 화면에 표시하지 않음)");ui.text_edit_singleline(&mut self.key_path);
-                if ui.button("연결 설정 저장").clicked(){let mut settings=self.settings.clone();settings["provider"]=json!({"protocol":self.protocol,"baseUrl":self.endpoint,"model":self.model});if !self.key_path.is_empty(){settings["provider"]["apiKeyPath"]=json!(self.key_path);}self.settings=settings.clone();self.request("settings.update",settings,Pending::Generic("설정 저장".into()));}
-                ui.collapsing("전체 설정 (JSON)",|ui|{ui.add(egui::TextEdit::multiline(&mut self.advanced_settings).code_editor().desired_rows(8).desired_width(f32::INFINITY));if ui.button("전체 설정 검증·저장").clicked(){match serde_json::from_str::<Value>(&self.advanced_settings){Ok(value)=>{self.settings=value.clone();self.request("settings.update",value,Pending::Generic("전체 설정".into()));},Err(error)=>self.status=error.to_string()}}});
+                if ui.add_enabled(!saving, egui::Button::new("연결 설정 저장")).clicked(){self.save_connection_settings();}
+                ui.collapsing("전체 설정 (JSON)",|ui|{ui.add(egui::TextEdit::multiline(&mut self.advanced_settings).code_editor().desired_rows(8).desired_width(f32::INFINITY));if ui.add_enabled(!saving, egui::Button::new("전체 설정 검증·저장")).clicked(){self.save_advanced_settings();}});
+                });
                 ui.separator();ui.heading("언어 서버 · 현재 세션");
                 ui.label("서버는 별도 설치·관리합니다. 로컬 또는 SSH 대상에서 지정한 명령을 실행합니다.");
-                egui::ComboBox::from_label("서버 preset").selected_text(&self.lsp_command).show_ui(ui,|ui|{for server in &self.lsp_catalog{if ui.selectable_label(false,text(server,"id")).clicked(){self.lsp_command=text(server,"command").into();self.lsp_args=server["args"].to_string();}}});
+                egui::ComboBox::from_label("서버 preset").selected_text(&self.lsp_command).show_ui(ui,|ui|{for server in self.lsp_catalog.clone(){if ui.selectable_label(false,text(&server,"id")).clicked(){self.select_lsp_preset(&server);}}});
                 ui.text_edit_singleline(&mut self.lsp_command);ui.label("인자 JSON 배열");ui.text_edit_singleline(&mut self.lsp_args);
                 if ui.button("언어 서버 시작").clicked(){
                     if let Some(session)=self.sessions.iter().find(|s|text(s,"id")==self.prefs.selected_session){

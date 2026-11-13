@@ -1,6 +1,78 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Compare paths without blocking the UI on filesystem/network canonicalization.
+/// Remote paths retain POSIX case and separator semantics.
+pub fn file_key(cwd: &str, path: &str, remote: bool) -> String {
+    if remote {
+        let joined = if path.starts_with('/') {
+            path.to_owned()
+        } else {
+            format!("{cwd}/{path}")
+        };
+        let mut parts = Vec::new();
+        for part in joined.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                _ => parts.push(part),
+            }
+        }
+        return format!("/{}", parts.join("/"));
+    }
+    let joined = std::path::Path::new(cwd).join(path);
+    let mut normalized = std::path::PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(part.as_os_str()),
+        }
+    }
+    let key = normalized.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let key = key
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&key)
+        .replace('\\', "/")
+        .to_lowercase();
+    key
+}
+
+pub fn language_server(
+    server: &serde_json::Value,
+    root: &std::path::Path,
+    node: &str,
+    local: bool,
+) -> (String, String) {
+    let managed = root.join(".tools/languages/node_modules/pyright/langserver.index.js");
+    if local && server["id"] == "pyright" && managed.is_file() {
+        return (
+            node.into(),
+            serde_json::json!([managed.to_string_lossy(), "--stdio"]).to_string(),
+        );
+    }
+    (
+        server["command"].as_str().unwrap_or_default().into(),
+        server["args"].to_string(),
+    )
+}
+
+pub fn command_status(result: &serde_json::Value) -> String {
+    match result["exitCode"].as_i64() {
+        Some(0) => "명령 실행 완료".into(),
+        Some(code) => format!("명령 실패 (종료 코드 {code})"),
+        None => format!(
+            "명령 실행: {}",
+            result["status"].as_str().unwrap_or("결과 수신")
+        ),
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {

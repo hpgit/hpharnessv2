@@ -108,6 +108,9 @@ impl HarnessApp {
                 .clicked()
                 {
                     self.left_tab = 1 - self.left_tab;
+                    if self.left_tab == 1 {
+                        self.refresh_files();
+                    }
                 }
             });
         });
@@ -263,19 +266,15 @@ impl HarnessApp {
                     }
                 })
                 .unwrap_or_default();
-            self.request(
-                "files.list",
-                json!({"sessionId":self.prefs.selected_session,"path":self.file_dir}),
-                Pending::Files(self.prefs.selected_session.clone()),
-            );
+            self.refresh_files();
         }
         for file in self.files.clone() {
             let directory = file["isDirectory"].as_bool().unwrap_or(false);
             let path = text(&file, "path").to_owned();
-            let selected = self
-                .buffers
-                .get(self.active_buffer)
-                .is_some_and(|b| b.path == path && b.session == self.prefs.selected_session);
+            let selected = self.buffers.get(self.active_buffer).is_some_and(|b| {
+                b.session == self.prefs.selected_session
+                    && self.same_file(&b.session, &b.path, &path)
+            });
             if nav_row(
                 ui,
                 if directory { Icon::Folder } else { Icon::Code },
@@ -286,11 +285,7 @@ impl HarnessApp {
             {
                 if directory {
                     self.file_dir = path.clone();
-                    self.request(
-                        "files.list",
-                        json!({"sessionId":self.prefs.selected_session,"path":path}),
-                        Pending::Files(self.prefs.selected_session.clone()),
-                    );
+                    self.refresh_files();
                 } else {
                     let extension = PathBuf::from(&path)
                         .extension()
@@ -615,6 +610,7 @@ impl HarnessApp {
                         if icon_button(ui, Icon::Plus, "파일과 도구").clicked() {
                             self.left_tab = 1;
                             self.prefs.sidebar_collapsed = false;
+                            self.refresh_files();
                         }
                         if ui
                             .add(

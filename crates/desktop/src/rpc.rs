@@ -19,6 +19,12 @@ pub struct Client {
 }
 
 impl Client {
+    #[cfg(test)]
+    pub fn test_pair() -> (Self, Receiver<Value>, Sender<Incoming>) {
+        let (tx, requests) = mpsc::channel();
+        let (responses, rx) = mpsc::channel();
+        (Self { tx, rx, next_id: 1 }, requests, responses)
+    }
     pub fn launch(root: &Path, context: eframe::egui::Context) -> Self {
         let (tx, commands) = mpsc::channel::<Value>();
         let (events, rx) = mpsc::channel();

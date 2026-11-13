@@ -16,3 +16,4 @@ config/local.yaml
 secrets/
 test-results/
 .local/
+/.qa/
