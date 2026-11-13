@@ -6,6 +6,7 @@ The single file can be deployed to a Python-equipped Linux host or container.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, ExitStack
 import base64
 import datetime as dt
 import hashlib
@@ -121,14 +122,44 @@ def terminate_child(child):
     child.wait(timeout=10)
 
 
+@contextmanager
+def resource_lock(lock, code="FILE_BUSY"):
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    if lock.is_dir():
+        raise WorkerError(code, "Legacy directory lock requires inspection before removal")
+    # Keep the inode; OS ownership is automatically released if the worker dies.
+    with lock.open("a+b") as stream:
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise WorkerError(code, "Another worker operation holds this resource") from None
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def run_job(directory):
     """Detached owner keeps an actual Popen handle; cancellation never kills a stale recorded PID."""
     directory = Path(directory)
     metadata = read_json(directory / "job.json")
     started = time.monotonic()
     child = None
+    resources = ExitStack()
     result = dict(metadata, status="failed", finished_at=None, exit_code=None)
     try:
+        if metadata.get("device_serial"):
+            resources.enter_context(resource_lock(directory.parent.parent / "devices" / digest(metadata["device_serial"].encode()), "DEVICE_BUSY"))
         if (directory / "cancel").exists():
             result["status"] = "cancelled"
             return
@@ -150,20 +181,42 @@ def run_job(directory):
                 result["status"] = "completed" if child.returncode == 0 else "failed"
     except Exception as exc:
         result["error"] = str(exc)
+        result["error_code"] = getattr(exc, "code", "EXECUTION_ERROR")
         if child is not None:
             terminate_child(child)
     finally:
         result["finished_at"] = timestamp()
+        if metadata.get("sdk_audit"):
+            audit = dict(metadata["sdk_audit"])
+            try:
+                baseline = Path(audit["baseline"]["path"])
+                audit["original_unchanged"] = baseline.exists() and digest(baseline.read_bytes()) == audit["baseline"]["sha256"]
+                if not audit["original_unchanged"]:
+                    result["status"] = "failed"
+                    audit["integrity_error"] = "Registered command modified the original ONNX; inspect before any further action"
+                output = Path(audit["output"])
+                if result["status"] == "completed" and output.exists():
+                    audit["output_sha256"] = digest(output.read_bytes())
+            except Exception as exc:
+                audit["integrity_error"] = "Integrity verification failed: " + str(exc)
+                result["status"] = "failed"
+            audit.update(run={k: v for k, v in result.items() if k != "sdk_audit"}, audit_status="complete")
+            atomic_json(directory.parent.parent / "sdk-runs" / (metadata["job_id"] + ".json"), audit)
         atomic_json(directory / "result.json", result)
+        resources.close()
 
 
 class Worker:
-    def __init__(self, root, state_dir):
+    def __init__(self, root, state_dir, mail_root=None):
         self.root = Path(root).expanduser().resolve(strict=True)
         if not self.root.is_dir():
             raise WorkerError("INVALID_ARGUMENT", "Workspace root must be a directory")
         self.state = Path(state_dir).expanduser().resolve()
         self.state.mkdir(parents=True, exist_ok=True)
+        # This path comes from trusted supervisor CLI configuration, never RPC params.
+        self.mail_root = Path(mail_root).expanduser().resolve() if mail_root else None
+        if self.mail_root is not None:
+            self.mail_root.mkdir(parents=True, exist_ok=True)
 
     def path(self, value=".", must_exist=False):
         if not isinstance(value, str) or "\0" in value:
@@ -214,6 +267,8 @@ class Worker:
         data = path.read_bytes()
         try:
             content = data.decode("utf-8")
+            if "\0" in content:
+                raise UnicodeDecodeError("utf-8", data, 0, len(data), "NUL byte")
         except UnicodeDecodeError:
             return {"path": str(path), "hash": digest(data), "encoding": "base64", "content": base64.b64encode(data).decode("ascii")}
         return {"path": str(path), "hash": digest(data), "encoding": "utf-8", "content": content}
@@ -221,15 +276,8 @@ class Worker:
     def rpc_files_write(self, p):
         path = self.path(p["path"])
         lock = self.state / "file-locks" / digest(str(path).encode())
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            lock.mkdir()
-        except FileExistsError:
-            raise WorkerError("FILE_BUSY", "Another worker write is in progress; an abandoned lock requires inspection") from None
-        try:
+        with resource_lock(lock):
             return self._write_file(p)
-        finally:
-            lock.rmdir()
 
     def _write_file(self, p):
         path = self.path(p["path"])
@@ -286,6 +334,11 @@ class Worker:
         directory = self.job_path(identifier)
         directory.mkdir(parents=True)
         metadata = {"job_id": identifier, "argv": argv, "cwd": str(cwd), "env": env, "created_at": timestamp(), "status": "starting", "timeout": bounded_timeout(p["timeout"]) if p.get("timeout") is not None else None}
+        if p.get("_device_serial"):
+            metadata["device_serial"] = p["_device_serial"]
+        if p.get("_sdk_audit"):
+            metadata["sdk_audit"] = p["_sdk_audit"]
+            atomic_json(self.state / "sdk-runs" / (identifier + ".json"), dict(p["_sdk_audit"], audit_status="pending", job_id=identifier))
         atomic_json(directory / "job.json", metadata)
         with (directory / "owner.log").open("wb") as log:
             owner = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--job-runner", str(directory)], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=os.name != "nt", creationflags=(subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0, close_fds=True)
@@ -379,16 +432,10 @@ class Worker:
         serial = p.get("serial")
         if not isinstance(serial, str) or not serial or serial.startswith("-"):
             raise WorkerError("INVALID_ARGUMENT", "An explicit device serial is required")
-        lock = self.state / "devices" / digest(serial.encode())
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            lock.mkdir()
-        except FileExistsError:
-            raise WorkerError("DEVICE_BUSY", "This device already has an active harness operation") from None
-        try:
-            return self.tool("adb", ["-s", serial, *command_args(p["argv"])], p)
-        finally:
-            lock.rmdir()
+        result = self.rpc_command_run({"argv": ["adb", "-s", serial, *command_args(p["argv"])], "cwd": p.get("cwd", "."), "timeout": p.get("timeout", 60), "_device_serial": serial})
+        if result.get("error_code") == "DEVICE_BUSY":
+            raise WorkerError("DEVICE_BUSY", result["error"])
+        return result
 
     def rpc_gpu_submit(self, p):
         identifier = "dummy-" + uuid.uuid4().hex
@@ -472,7 +519,8 @@ class Worker:
         input_hash = digest(input_path.read_bytes())
         replacements = {"{original_onnx}": str(original), "{input}": str(input_path), "{output}": str(output)}
         argv = [replacements.get(arg, arg) for arg in manifest["argv"]]
-        run = self.rpc_command_run({"argv": argv, "cwd": manifest.get("cwd", "."), "timeout": p.get("timeout", 600)})
+        audit = {"sdk": manifest["sdk"], "baseline": {"path": str(original), "sha256": original_hash}, "input": {"path": str(input_path), "sha256": input_hash}, "output": str(output), "metrics": {}, "validation": "command_only; numerical evaluation requires registered evaluator"}
+        run = self.rpc_command_run({"argv": argv, "cwd": manifest.get("cwd", "."), "timeout": p.get("timeout", 600), "_sdk_audit": audit})
         unchanged = original.exists() and digest(original.read_bytes()) == original_hash
         result = {"run": run, "sdk": manifest["sdk"], "baseline": {"path": str(original), "sha256": original_hash}, "input": {"path": str(input_path), "sha256": input_hash}, "original_unchanged": unchanged, "output": str(output), "metrics": {}, "validation": "command_only; numerical evaluation requires registered evaluator"}
         if not unchanged:
@@ -499,48 +547,100 @@ class Worker:
         namespace = client.Dispatch("Outlook.Application").GetNamespace("MAPI")
         since = dt.datetime.now() - dt.timedelta(days=int(p.get("days", 90)))
         limit = min(max(int(p.get("limit", 200)), 1), 5000)
-        archive = self.path(p.get("archive", "mail-archive"))
+        archive = self.mail_root / "mail-archive" if self.mail_root else (self.path(p["archive"]) if p.get("archive") else self.state / "mail-archive")
         archive.mkdir(parents=True, exist_ok=True)
-        quota = max(int(p.get("quota_bytes", 50 * 1024**3)), 0)
-        used = sum(entry.stat().st_size for entry in archive.rglob("*") if entry.is_file())
+        archive = archive.resolve()
+        if self.mail_root and not archive.is_relative_to(self.mail_root):
+            raise WorkerError("OUTSIDE_WORKSPACE", "Archive directory escapes configured mail root")
+        quota = min(max(int(p.get("quota_bytes", 50 * 1024**3)), 0), 50 * 1024**3)
+        quota_root = self.mail_root or archive
+        used = sum(entry.stat().st_size for entry in quota_root.rglob("*") if entry.is_file())
         quota_reached = False
         messages = []
-        # Default inbox and sent folders. ConversationID is kept; subject is never a thread key.
-        for folder_id, label in ((6, "inbox"), (5, "sent")):
-            items = namespace.GetDefaultFolder(folder_id).Items
-            items.Sort("[ReceivedTime]", True)
-            for item in items:
+        cursor = p.get("cursor")
+        snapshots = self.state / "outlook-snapshots"
+        snapshots.mkdir(parents=True, exist_ok=True)
+        if cursor:
+            if not isinstance(cursor, dict):
+                raise WorkerError("INVALID_ARGUMENT", "Invalid mail cursor")
+            identifier = safe_id(cursor.get("snapshot", ""))
+            snapshot = read_json(snapshots / (identifier + ".json"))
+            offset = int(cursor.get("offset", 0))
+            if time.time() >= snapshot["expires_at"]:
+                raise WorkerError("CURSOR_EXPIRED", "Mail snapshot expired; start a new fetch")
+            if offset < 0 or offset > len(snapshot["items"]):
+                raise WorkerError("INVALID_ARGUMENT", "Invalid mail cursor offset")
+        else:
+            identifier = uuid.uuid4().hex
+            snapshot = {"expires_at": time.time() + 86400, "items": [], "truncated": False}
+            offset = 0
+            # Freeze IDs before paging so live inserts cannot duplicate or skip older mail.
+            for folder_id, label in ((6, "inbox"), (5, "sent")):
+                folder = namespace.GetDefaultFolder(folder_id)
+                items = folder.Items
+                items.Sort("[ReceivedTime]", True)
+                for item in items:
+                    if getattr(item, "Class", None) != 43:
+                        continue
+                    if item.ReceivedTime.replace(tzinfo=None) < since:
+                        break
+                    if len(snapshot["items"]) >= 100000:
+                        snapshot["truncated"] = True
+                        break
+                    snapshot["items"].append({"entry_id": str(item.EntryID), "store_id": str(folder.StoreID), "folder": label})
+                if snapshot["truncated"]:
+                    break
+            atomic_json(snapshots / (identifier + ".json"), snapshot)
+            # Expired snapshots contain IDs only and can be safely reclaimed.
+            for expired in snapshots.glob("*.json"):
+                if expired.stat().st_mtime < time.time() - 86400:
+                    expired.unlink(missing_ok=True)
+        snapshot_id = identifier
+        next_offset = offset
+        skipped = 0
+        for item_index in range(offset, len(snapshot["items"])):
                 if len(messages) >= limit:
                     break
-                if getattr(item, "Class", None) != 43:
+                entry = snapshot["items"][item_index]
+                try:
+                    item = namespace.GetItemFromID(entry["entry_id"], entry["store_id"])
+                except Exception:
+                    # Deleted/moved items are absent from this frozen snapshot.
+                    skipped += 1
+                    next_offset = item_index + 1
                     continue
+                label = entry["folder"]
                 received = item.ReceivedTime
-                if received.replace(tzinfo=None) < since:
-                    break
                 identifier = digest(str(item.EntryID).encode())
                 attachments = [{"name": item.Attachments.Item(i).FileName, "size": item.Attachments.Item(i).Size, "downloaded": False} for i in range(1, item.Attachments.Count + 1)]
                 record = {"id": identifier, "entry_id": item.EntryID, "conversation_id": item.ConversationID, "folder": label, "subject": item.Subject, "body": item.Body, "html_body": item.HTMLBody, "sender": item.SenderEmailAddress, "to": item.To, "cc": item.CC, "received_at": received.isoformat(), "attachments": attachments}
                 data = json.dumps(record, ensure_ascii=False).encode("utf-8")
                 version = digest(data)
                 destination = archive / identifier / (version + (".msg" if p.get("archive_msg") else ".json"))
+                if not destination.resolve().is_relative_to(archive):
+                    raise WorkerError("OUTSIDE_WORKSPACE", "Archive message directory escapes archive root")
                 if not destination.exists():
                     if used + (int(item.Size) if p.get("archive_msg") else len(data)) > quota:
                         quota_reached = True
                         break
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     if p.get("archive_msg"):
-                        pending = destination.with_name(version + ".pending.msg")
-                        item.SaveAs(str(pending), 3)
-                        if used + pending.stat().st_size > quota:
-                            pending.unlink()
-                            quota_reached = True
-                            break
-                        os.replace(pending, destination)
+                        pending = destination.with_name(version + "." + uuid.uuid4().hex + ".pending.msg")
+                        try:
+                            item.SaveAs(str(pending), 3)
+                            if used + pending.stat().st_size > quota:
+                                quota_reached = True
+                                break
+                            os.replace(pending, destination)
+                        finally:
+                            pending.unlink(missing_ok=True)
                     else:
-                        destination.write_bytes(data)
+                        atomic_json(destination, record)
                     used += destination.stat().st_size
                 messages.append(record | {"original": str(destination), "version": version, "original_format": "msg_including_attachments" if p.get("archive_msg") else "outlook_properties_v1"})
-        return {"messages": messages, "partial": len(messages) >= limit or quota_reached, "quota_reached": quota_reached, "archive_bytes": used, "attachments_policy": "msg_archive_includes_attachment_bytes" if p.get("archive_msg") else "metadata_only; explicit fetch needed"}
+                next_offset = item_index + 1
+        next_cursor = {"snapshot": snapshot_id, "offset": next_offset} if next_offset < len(snapshot["items"]) else None
+        return {"messages": messages, "next_cursor": next_cursor, "partial": next_cursor is not None or quota_reached or snapshot["truncated"] or skipped > 0, "snapshot_truncated": snapshot["truncated"], "skipped_unavailable": skipped, "quota_reached": quota_reached, "archive_bytes": used, "quota_scope": "shared_knowledge_root" if self.mail_root else "worker_archive_only", "attachments_policy": "msg_archive_includes_attachment_bytes" if p.get("archive_msg") else "metadata_only; explicit fetch needed"}
 
     def rpc_outlook_attachment(self, p):
         client = self.com()
@@ -549,12 +649,31 @@ class Worker:
         attachment = item.Attachments.Item(int(p["index"]))
         if attachment.Size > int(p.get("max_bytes", 20 * 1024 * 1024)):
             raise WorkerError("ATTACHMENT_TOO_LARGE", "Attachment exceeds configured individual size limit")
-        destination = self.path(p["output"])
+        if self.mail_root:
+            attachment_root = self.mail_root / "mail-attachments"
+            destination = (attachment_root / p["output"]).resolve()
+            if not destination.is_relative_to(attachment_root):
+                raise WorkerError("OUTSIDE_WORKSPACE", "Attachment output escapes mail attachment root")
+        else:
+            destination = self.path(p["output"])
         if destination.exists():
             raise WorkerError("CONFLICT", "Attachment output already exists")
+        quota_root = self.mail_root or self.state / "mail-archive"
+        quota = min(max(int(p.get("quota_bytes", 50 * 1024**3)), 0), 50 * 1024**3)
+        used = sum(entry.stat().st_size for entry in quota_root.rglob("*") if entry.is_file())
+        if used + int(attachment.Size) > quota:
+            raise WorkerError("QUOTA_EXCEEDED", "Mail collection quota reached")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        attachment.SaveAsFile(str(destination))
-        return {"path": str(destination), "sha256": digest(destination.read_bytes())}
+        pending = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".pending")
+        try:
+            attachment.SaveAsFile(str(pending))
+            if pending.stat().st_size > int(p.get("max_bytes", 20 * 1024 * 1024)) or used + pending.stat().st_size > quota:
+                raise WorkerError("QUOTA_EXCEEDED", "Extracted attachment exceeds size or collection quota")
+            # Refuse replacement even when another extractor raced the initial check.
+            os.link(pending, destination)
+        finally:
+            pending.unlink(missing_ok=True)
+        return {"path": str(destination), "sha256": digest(destination.read_bytes()), "quota_scope": "shared_knowledge_root" if self.mail_root else "worker_archive_only"}
 
     def rpc_office_edit(self, p):
         if p.get("approved") is not True:
@@ -571,6 +690,7 @@ class Worker:
         try:
             if path.suffix.lower() in (".docx", ".docm", ".doc"):
                 app = client.DispatchEx("Word.Application")
+                app.DisplayAlerts = False
                 document = app.Documents.Open(str(path), ReadOnly=False)
                 if document.ReadOnly:
                     raise WorkerError("DOCUMENT_BUSY", "Word opened the document read-only")
@@ -579,6 +699,7 @@ class Worker:
                 document.Save()
             elif path.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
                 app = client.DispatchEx("Excel.Application")
+                app.DisplayAlerts = False
                 document = app.Workbooks.Open(str(path), ReadOnly=False)
                 if document.ReadOnly:
                     raise WorkerError("DOCUMENT_BUSY", "Excel opened the document read-only")
@@ -587,6 +708,7 @@ class Worker:
                 document.Save()
             elif path.suffix.lower() in (".pptx", ".pptm", ".ppt"):
                 app = client.DispatchEx("PowerPoint.Application")
+                app.DisplayAlerts = 1
                 document = app.Presentations.Open(str(path), ReadOnly=False, WithWindow=False)
                 for change in p.get("shapes", []):
                     shape = document.Slides(int(change["slide"])).Shapes(change["name"])
@@ -603,35 +725,45 @@ class Worker:
                 raise WorkerError("UNSUPPORTED", "Unsupported Office document format")
             return {"path": str(path), "backup": str(backup), "hash": digest(path.read_bytes()), "corporate_drm_validated": False}
         finally:
-            if document is not None:
-                if path.suffix.lower() in (".pptx", ".pptm", ".ppt"):
-                    # Never turn an exception into a modal save prompt or a partial save.
-                    document.Saved = True
-                    document.Close()
-                else:
-                    document.Close(SaveChanges=False)
-            if app is not None:
-                app.Quit()
+            try:
+                if document is not None:
+                    if path.suffix.lower() in (".pptx", ".pptm", ".ppt"):
+                        # Never turn an exception into a modal save prompt or a partial save.
+                        document.Saved = True
+                        document.Close()
+                    else:
+                        document.Close(SaveChanges=False)
+            finally:
+                if app is not None:
+                    app.Quit()
 
     def rpc_office_word_read(self, p):
         client = self.com()
         path = self.path(p["path"], True)
+        initial_hash = digest(path.read_bytes())
         app = client.DispatchEx("Word.Application")
         document = None
         try:
+            app.DisplayAlerts = False
             document = app.Documents.Open(str(path), ReadOnly=True)
-            return {"path": str(path), "hash": digest(path.read_bytes()), "text": document.Content.Text, "corporate_drm_validated": False}
+            if digest(path.read_bytes()) != initial_hash:
+                raise WorkerError("CONFLICT", "Document changed during extraction")
+            return {"path": str(path), "hash": initial_hash, "text": document.Content.Text, "corporate_drm_validated": False}
         finally:
-            if document is not None:
-                document.Close(SaveChanges=False)
-            app.Quit()
+            try:
+                if document is not None:
+                    document.Close(SaveChanges=False)
+            finally:
+                app.Quit()
 
     def rpc_office_excel_read(self, p):
         client = self.com()
         path = self.path(p["path"], True)
+        initial_hash = digest(path.read_bytes())
         app = client.DispatchEx("Excel.Application")
         document = None
         try:
+            app.DisplayAlerts = False
             document = app.Workbooks.Open(str(path), ReadOnly=True)
             sheets = []
             for sheet in document.Worksheets:
@@ -641,18 +773,24 @@ class Worker:
                 rows, columns = min(area.Rows.Count, 2000), min(area.Columns.Count, 200)
                 cells = area.Resize(rows, columns).Value
                 sheets.append({"name": sheet.Name, "range": area.Address, "values": cells, "truncated": rows < area.Rows.Count or columns < area.Columns.Count})
-            return {"path": str(path), "hash": digest(path.read_bytes()), "sheets": sheets, "corporate_drm_validated": False}
+            if digest(path.read_bytes()) != initial_hash:
+                raise WorkerError("CONFLICT", "Document changed during extraction")
+            return {"path": str(path), "hash": initial_hash, "sheets": sheets, "corporate_drm_validated": False}
         finally:
-            if document is not None:
-                document.Close(SaveChanges=False)
-            app.Quit()
+            try:
+                if document is not None:
+                    document.Close(SaveChanges=False)
+            finally:
+                app.Quit()
 
     def rpc_office_ppt_templates(self, p):
         client = self.com()
         path = self.path(p["path"], True)
+        initial_hash = digest(path.read_bytes())
         app = client.DispatchEx("PowerPoint.Application")
         document = None
         try:
+            app.DisplayAlerts = 1
             document = app.Presentations.Open(str(path), ReadOnly=True, WithWindow=False)
             slides = []
             for slide in document.Slides:
@@ -660,11 +798,15 @@ class Worker:
                 for shape in slide.Shapes:
                     shapes.append({"name": shape.Name, "type": shape.Type, "left": shape.Left, "top": shape.Top, "width": shape.Width, "height": shape.Height, "text": shape.TextFrame.TextRange.Text if shape.HasTextFrame else None})
                 slides.append({"index": slide.SlideIndex, "layout": slide.CustomLayout.Name, "shapes": shapes})
-            return {"path": str(path), "hash": digest(path.read_bytes()), "slides": slides, "corporate_drm_validated": False}
+            if digest(path.read_bytes()) != initial_hash:
+                raise WorkerError("CONFLICT", "Document changed during extraction")
+            return {"path": str(path), "hash": initial_hash, "slides": slides, "corporate_drm_validated": False}
         finally:
-            if document is not None:
-                document.Close()
-            app.Quit()
+            try:
+                if document is not None:
+                    document.Close()
+            finally:
+                app.Quit()
 
     def rpc_office_ppt_add(self, p):
         if p.get("approved") is not True:
@@ -682,6 +824,7 @@ class Worker:
         app = client.DispatchEx("PowerPoint.Application")
         document = None
         try:
+            app.DisplayAlerts = 1
             document = app.Presentations.Open(str(target), ReadOnly=False, WithWindow=False)
             after = int(p.get("after", document.Slides.Count))
             source_index = int(p["template_slide"])
@@ -704,10 +847,12 @@ class Worker:
             document.Save()
             return {"path": str(target), "hash": digest(target.read_bytes()), "backup": str(backup), "slide": after + 1, "template": str(template), "template_slide": source_index, "corporate_drm_validated": False}
         finally:
-            if document is not None:
-                document.Saved = True
-                document.Close()
-            app.Quit()
+            try:
+                if document is not None:
+                    document.Saved = True
+                    document.Close()
+            finally:
+                app.Quit()
 
     def desktop(self):
         if os.name != "nt":
@@ -803,11 +948,12 @@ def main():
     parser.add_argument("--root", default=".")
     parser.add_argument("--state-dir", default=str(Path.home() / ".hpharness" / "worker"))
     parser.add_argument("--job-runner")
+    parser.add_argument("--mail-root")
     args = parser.parse_args()
     if args.job_runner:
         run_job(args.job_runner)
         return
-    worker = Worker(args.root, args.state_dir)
+    worker = Worker(args.root, args.state_dir, args.mail_root)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stdin.reconfigure(encoding="utf-8")

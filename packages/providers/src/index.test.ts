@@ -79,7 +79,7 @@ test("malformed args and incomplete generations never execute tools", () => {
     }),
   );
 });
-test("HTTP transport and redacted errors", async () => {
+test("HTTP transport preserves bounded provider diagnostics", async () => {
   const server = createServer((req, res) => {
     res.writeHead(401);
     res.end("secret private diagnostic");
@@ -95,11 +95,34 @@ test("HTTP transport and redacted errors", async () => {
         },
         { messages: [{ role: "user", content: "test" }] },
       ),
-      (e) => e instanceof Error && e.message === "Model endpoint HTTP 401",
+      (e: any) => e.status === 401 && e.body === "secret private diagnostic" && e.message.includes("private diagnostic"),
     );
   } finally {
     server.close();
   }
+});
+test("protocol switches normalize foreign provider data", () => {
+  const response = decode("responses", { status: "completed", output: [
+    { type: "reasoning", summary: [] },
+    { type: "function_call", call_id: "c", name: "x", arguments: "{}" },
+  ] });
+  const anthropic = encode({ ...base, protocol: "anthropic" }, { messages: [response.message] });
+  assert.deepEqual((anthropic.messages as any[])[0].content, [{ type: "tool_use", id: "c", name: "x", input: {} }]);
+  const message = decode("anthropic", { content: [{ type: "text", text: "hello" }], stop_reason: "end_turn" }).message;
+  assert.deepEqual(encode(base, { messages: [message] }).input, [{ role: "assistant", content: "hello" }]);
+  assert.throws(() => decode("responses", { error: { message: "quota exhausted" } }), /quota exhausted/);
+});
+test("request timeout remains retryable and caller cancellation remains distinct", async () => {
+  const server = createServer(() => {});
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const config = { ...base, timeoutMs: 25, baseUrl: `http://127.0.0.1:${(server.address() as any).port}` };
+  try {
+    await assert.rejects(complete(config, { messages: [] }), (e: any) => e.status === 408 && e.cause.code === "ETIMEDOUT");
+    const controller = new AbortController();
+    controller.abort(new Error("caller stopped"));
+    await assert.rejects(complete(config, { messages: [], signal: controller.signal }), /caller stopped/);
+  } finally { server.closeAllConnections(); server.close(); }
 });
 for (const protocol of [
   "responses",

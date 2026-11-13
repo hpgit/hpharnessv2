@@ -23,6 +23,8 @@ pub struct Buffer {
     pub saved: String,
     pub version: String,
     pub conflict: Option<String>,
+    #[serde(default)]
+    pub external: Option<(String, String)>,
 }
 
 pub fn lsp_position(text: &str, char_index: usize) -> (usize, usize) {
@@ -128,16 +130,33 @@ impl Buffer {
         self.saved = submitted.to_owned();
         self.version = version;
         self.conflict = None;
+        self.external = None;
     }
     pub fn reload(&mut self, text: String, version: String) -> bool {
+        if version == self.version {
+            return true;
+        }
         if self.dirty() {
             self.conflict = Some("외부 변경 감지: 편집 내용이 보존되었습니다.".into());
+            self.external = Some((text, version));
             return false;
         }
         self.text = text.clone();
         self.saved = text;
         self.version = version;
+        self.conflict = None;
+        self.external = None;
         true
+    }
+    pub fn resolve_external(&mut self, use_disk: bool) {
+        if let Some((text, version)) = self.external.take() {
+            if use_disk {
+                self.text = text.clone();
+            }
+            self.saved = text;
+            self.version = version;
+            self.conflict = None;
+        }
     }
 }
 
@@ -152,6 +171,7 @@ mod tests {
             saved: "before".into(),
             version: "v1".into(),
             conflict: None,
+            external: None,
         }
     }
     #[test]
@@ -179,6 +199,35 @@ mod tests {
         assert!(b.reload("agent".into(), "v2".into()));
         assert!(!b.dirty());
         assert_eq!(b.version, "v2");
+    }
+    #[test]
+    fn unchanged_poll_does_not_report_dirty_buffer_conflict() {
+        let mut b = buffer();
+        b.text = "user".into();
+        assert!(b.reload("before".into(), "v1".into()));
+        assert!(b.conflict.is_none());
+        assert_eq!(b.text, "user");
+    }
+    #[test]
+    fn resolving_conflict_keeps_local_edits_and_rebases_version() {
+        let mut b = buffer();
+        b.text = "user".into();
+        b.reload("agent".into(), "v2".into());
+        b.resolve_external(false);
+        assert_eq!(b.text, "user");
+        assert_eq!(b.saved, "agent");
+        assert_eq!(b.version, "v2");
+        assert!(b.dirty());
+        assert!(b.conflict.is_none());
+    }
+    #[test]
+    fn resolving_conflict_can_accept_latest_disk_content() {
+        let mut b = buffer();
+        b.text = "user".into();
+        b.reload("agent".into(), "v2".into());
+        b.resolve_external(true);
+        assert_eq!(b.text, "agent");
+        assert!(!b.dirty());
     }
     #[test]
     fn lsp_handles_korean_and_surrogate_pairs() {

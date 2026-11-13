@@ -48,10 +48,35 @@ export class ProviderError extends Error {
   constructor(
     message: string,
     public status?: number,
+    public body?: unknown,
   ) {
     super(message);
     this.name = "ProviderError";
   }
+}
+function replayData(message: Message, protocol: Protocol): unknown[] | undefined {
+  const data = message.providerData as { protocol?: Protocol; data?: unknown } | undefined;
+  return data?.protocol === protocol && Array.isArray(data.data) ? data.data : undefined;
+}
+function errorDetail(body: unknown): string {
+  if (typeof body === "string") return body.slice(0, 4096);
+  return JSON.stringify(body)?.slice(0, 4096) ?? "";
+}
+async function diagnosticBody(response: Awaited<ReturnType<typeof requestFetch>>): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Buffer[] = [];
+  let remaining = 4096;
+  try {
+    while (remaining > 0) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value.subarray(0, remaining));
+      chunks.push(chunk);
+      remaining -= chunk.length;
+    }
+  } finally { await reader.cancel(); }
+  return Buffer.concat(chunks).toString("utf8");
 }
 const paths: Record<Protocol, string> = {
   responses: "responses",
@@ -99,8 +124,8 @@ export function encode(
           call_id: m.toolCallId,
           output: m.content,
         });
-      else if (m.role === "assistant" && Array.isArray(m.providerData))
-        input.push(...m.providerData);
+      else if (m.role === "assistant" && replayData(m, "responses"))
+        input.push(...replayData(m, "responses")!);
       else {
         if (m.content) input.push({ role: m.role, content: m.content });
         for (const t of m.toolCalls ?? [])
@@ -171,8 +196,8 @@ export function encode(
               content: m.content,
             },
           ]
-        : m.role === "assistant" && Array.isArray(m.providerData)
-          ? m.providerData
+        : m.role === "assistant" && replayData(m, "anthropic")
+          ? replayData(m, "anthropic")!
           : [
               ...(m.content ? [{ type: "text", text: m.content }] : []),
               ...(m.toolCalls ?? []).map((t) => ({
@@ -207,7 +232,7 @@ export function encode(
   };
 }
 export function decode(protocol: Protocol, body: any): ModelReply {
-  if (body.error) throw new ProviderError("Provider returned an error");
+  if (body.error) throw new ProviderError("Provider returned an error: " + errorDetail(body.error), undefined, body.error);
   let message: Message, finishReason: string;
   if (protocol === "responses") {
     if (!Array.isArray(body.output))
@@ -227,7 +252,7 @@ export function decode(protocol: Protocol, body: any): ModelReply {
           name: x.name,
           arguments: argumentsObject(x.arguments),
         })),
-      providerData: body.output,
+      providerData: { protocol, data: body.output },
     };
     finishReason = body.status ?? "unknown";
     if (["failed", "cancelled", "incomplete"].includes(finishReason))
@@ -264,7 +289,7 @@ export function decode(protocol: Protocol, body: any): ModelReply {
           name: x.name,
           arguments: argumentsObject(x.input),
         })),
-      providerData: body.content,
+      providerData: { protocol, data: body.content },
     };
     finishReason = body.stop_reason ?? "unknown";
     if (["max_tokens", "refusal"].includes(finishReason))
@@ -288,6 +313,8 @@ export async function complete(
   request: ModelRequest,
 ): Promise<ModelReply> {
   if (!config.model?.trim()) throw new ProviderError("Configure a model");
+  if (config.timeoutMs !== undefined && (!Number.isInteger(config.timeoutMs) || config.timeoutMs < 1 || config.timeoutMs > 2147483647))
+    throw new ProviderError("timeoutMs must be an integer from 1 to 2147483647");
   const key = config.apiKeyPath
     ? (await readFile(config.apiKeyPath, "utf8")).trim()
     : undefined;
@@ -313,9 +340,10 @@ export async function complete(
           proxyTls: ca ? { ca } : undefined,
         })
       : new Agent({ connect: ca ? { ca } : undefined });
+  const timeout = AbortSignal.timeout(config.timeoutMs ?? 120000);
   try {
     const signal = AbortSignal.any([
-      AbortSignal.timeout(config.timeoutMs ?? 120000),
+      timeout,
       ...(request.signal ? [request.signal] : []),
     ]);
     const response = await requestFetch(endpoint(config), {
@@ -327,13 +355,21 @@ export async function complete(
       redirect: "error",
     });
     if (!response.ok) {
-      await response.body?.cancel();
+      const body = await diagnosticBody(response);
       throw new ProviderError(
-        "Model endpoint HTTP " + response.status,
+        "Model endpoint HTTP " + response.status + (body ? ": " + body : ""),
         response.status,
+        body,
       );
     }
     return decode(config.protocol, await response.json());
+  } catch (error) {
+    if (timeout.aborted && !request.signal?.aborted) {
+      const failure = new ProviderError("Model request timed out after " + (config.timeoutMs ?? 120000) + "ms", 408);
+      failure.cause = { code: "ETIMEDOUT" };
+      throw failure;
+    }
+    throw error;
   } finally {
     await dispatcher.close();
   }

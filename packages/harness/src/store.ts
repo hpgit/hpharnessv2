@@ -12,6 +12,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,type TEXT NOT NULL,created_at TEXT NOT NULL,json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY,project_id TEXT,content TEXT NOT NULL,kind TEXT NOT NULL,source TEXT NOT NULL,updated_at TEXT NOT NULL);
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(id UNINDEXED,content,tokenize='trigram');`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS message_session ON objects(kind,json_extract(json,'$.sessionId'));
+      CREATE TABLE IF NOT EXISTS memory_confirmation(id TEXT PRIMARY KEY,confirmed INTEGER NOT NULL);`);
   }
   put(kind: string, value: { id: string }) {
     this.db
@@ -32,6 +34,23 @@ export class Store {
       .prepare("SELECT json FROM objects WHERE kind=? ORDER BY rowid")
       .all(kind)
       .map((r) => JSON.parse(String(r.json)));
+  }
+  messages<T>(sessionId: string): T[] {
+    return this.db.prepare("SELECT json FROM objects WHERE kind='message' AND json_extract(json,'$.sessionId')=? ORDER BY rowid")
+      .all(sessionId).map((r) => JSON.parse(String(r.json)));
+  }
+  memoryDelete(id: string) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.db.prepare("DELETE FROM memories WHERE id=?").run(id);
+      this.db.prepare("DELETE FROM memory_fts WHERE id=?").run(id);
+      this.db.prepare("DELETE FROM memory_confirmation WHERE id=?").run(id);
+      this.db.exec("COMMIT");
+      return { id, deleted: Number(result.changes) > 0 };
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+  memoryGet(id: string) {
+    return this.db.prepare("SELECT id,project_id AS projectId,content,kind,source FROM memories WHERE id=?").get(id);
   }
   event(type: string, data: unknown) {
     const event = {
@@ -71,6 +90,7 @@ export class Store {
     content: string;
     kind?: string;
     source?: string;
+    confirmed?: boolean;
   }) {
     const entry = {
       ...value,
@@ -95,6 +115,8 @@ export class Store {
           entry.updatedAt,
         );
       this.db.prepare("DELETE FROM memory_fts WHERE id=?").run(entry.id);
+      this.db.prepare("INSERT INTO memory_confirmation VALUES(?,?) ON CONFLICT(id) DO UPDATE SET confirmed=excluded.confirmed")
+        .run(entry.id, value.confirmed === true ? 1 : 0);
       this.db
         .prepare("INSERT INTO memory_fts VALUES(?,?)")
         .run(entry.id, entry.content);
@@ -113,7 +135,7 @@ export class Store {
     if (projectId) args.push(projectId);
     return this.db
       .prepare(
-        `SELECT id,project_id AS projectId,content,kind,source,updated_at AS updatedAt FROM memories WHERE content LIKE ? ESCAPE '\\' ${clause} ORDER BY updated_at DESC LIMIT 200`,
+        `SELECT id,project_id AS projectId,content,kind,source,updated_at AS updatedAt,COALESCE((SELECT confirmed FROM memory_confirmation c WHERE c.id=memories.id),0) AS confirmed FROM memories WHERE content LIKE ? ESCAPE '\\' ${clause} ORDER BY updated_at DESC LIMIT 200`,
       )
       .all(...args);
   }

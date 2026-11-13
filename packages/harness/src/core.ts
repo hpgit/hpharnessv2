@@ -22,7 +22,7 @@ export const builtinCore: CoreContract = {
         return { ...result, continue: !!result.toolCalls?.length };
       } catch (error: any) {
         const transient =
-          [429, 500, 502, 503, 504].includes(error.status) ||
+          [408, 429, 500, 502, 503, 504].includes(error.status) ||
           ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT"].includes(
             error.cause?.code,
           );

@@ -61,9 +61,11 @@ enum Pending {
     CreateSession,
     Files(String),
     Read(String),
+    RefreshRead(String, String),
     Save { index: usize, submitted: String },
     Command,
     Memory,
+    MemoryMutation,
     Generic(String),
     Silent,
     LspStart,
@@ -310,7 +312,7 @@ impl HarnessApp {
             pty_input: String::new(),
             git_patch: String::new(),
             git_output: String::new(),
-            rpc_method: "tools.list".into(),
+            rpc_method: "runs.status".into(),
             rpc_params: "{}".into(),
             rpc_output: String::new(),
             last_poll: Instant::now(),
@@ -398,6 +400,16 @@ impl HarnessApp {
         self.request("files.list", json!({"sessionId":id}), Pending::Files(id));
     }
     fn refresh(&mut self) {
+        let open_files: Vec<_> = self
+            .buffers
+            .iter()
+            .map(|buffer| (buffer.session.clone(), buffer.path.clone()))
+            .collect();
+        for (session, path) in open_files {
+            if !self.pending.values().any(|pending| matches!(pending, Pending::RefreshRead(pending_session, pending_path) if pending_session == &session && pending_path == &path)) {
+                self.request("files.read", json!({"sessionId":session,"path":path}), Pending::RefreshRead(session, path));
+            }
+        }
         if self.search_open {
             self.request("sessions.list", json!({}), Pending::AllSessions);
         }
@@ -488,6 +500,11 @@ impl HarnessApp {
                         Pending::Runs => self.runs = array(result),
                         Pending::Approvals => self.approvals = array(result),
                         Pending::Settings => {
+                            let mut result = result;
+                            if let Some(settings) = result.as_object_mut() {
+                                settings.remove("configPath");
+                                settings.remove("configError");
+                            }
                             let p = &result["provider"];
                             self.protocol = p["protocol"].as_str().unwrap_or("responses").into();
                             self.endpoint = p["baseUrl"]
@@ -528,6 +545,19 @@ impl HarnessApp {
                                 self.files = array(result);
                             }
                         }
+                        Pending::RefreshRead(session, _) => {
+                            let path = text(&result, "path");
+                            if let Some(buffer) = self
+                                .buffers
+                                .iter_mut()
+                                .find(|b| b.path == path && b.session == session)
+                            {
+                                buffer.reload(
+                                    text(&result, "content").into(),
+                                    text(&result, "version").into(),
+                                );
+                            }
+                        }
                         Pending::Read(session) => {
                             let path = text(&result, "path").to_owned();
                             let content = text(&result, "content").to_owned();
@@ -547,6 +577,7 @@ impl HarnessApp {
                                     saved: content,
                                     version,
                                     conflict: None,
+                                    external: None,
                                 });
                                 self.active_buffer = self.buffers.len() - 1;
                             }
@@ -563,6 +594,13 @@ impl HarnessApp {
                                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
                             );
                             self.terminal.push('\n');
+                        }
+                        Pending::MemoryMutation => {
+                            self.request(
+                                "memory.list",
+                                json!({"projectId":self.prefs.selected_project}),
+                                Pending::Memory,
+                            );
                         }
                         Pending::Memory => self.memories = array(result),
                         Pending::Generic(label) => {
@@ -729,6 +767,17 @@ impl HarnessApp {
         ui.label(RichText::new(&buffer.path).small());
         if let Some(conflict) = &buffer.conflict {
             ui.colored_label(Color32::from_rgb(190, 60, 45), conflict);
+            if buffer.external.is_some() {
+                ui.horizontal(|ui| {
+                    if ui.button("내 편집 유지 · 최신 원본에 적용").clicked() {
+                        buffer.resolve_external(false);
+                    }
+                    if ui.button("내 편집 복사 후 디스크 내용 사용").clicked() {
+                        ui.ctx().copy_text(buffer.text.clone());
+                        buffer.resolve_external(true);
+                    }
+                });
+            }
         }
         let extension = PathBuf::from(&buffer.path)
             .extension()
@@ -787,7 +836,7 @@ impl HarnessApp {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.command)
                             .desired_width((ui.available_width() - 75.0).max(120.0))
-                            .hint_text("명령 입력 (대화형 PTY 아님)"),
+                            .hint_text("argv JSON 배열 예: [\"git\",\"status\"]"),
                     );
                     if ui
                         .add_enabled(
@@ -797,13 +846,21 @@ impl HarnessApp {
                         .clicked()
                         && !self.command.trim().is_empty()
                     {
-                        let command = std::mem::take(&mut self.command);
-                        self.terminal.push_str(&format!("\n$ {command}\n"));
-                        self.request(
-                            "command.run",
-                            json!({"sessionId":self.prefs.selected_session,"command":command}),
-                            Pending::Command,
-                        );
+                        match serde_json::from_str::<Vec<String>>(&self.command) {
+                            Ok(argv) if !argv.is_empty() && !argv[0].is_empty() => {
+                                let command = std::mem::take(&mut self.command);
+                                self.terminal.push_str(&format!("\n$ {command}\n"));
+                                self.request(
+                                    "command.run",
+                                    json!({"sessionId":self.prefs.selected_session,"argv":argv}),
+                                    Pending::Command,
+                                );
+                            }
+                            _ => {
+                                self.status =
+                                    "명령은 비어 있지 않은 문자열 JSON 배열이어야 합니다.".into()
+                            }
+                        }
                     }
                 });
                 egui::ScrollArea::both()
@@ -1293,9 +1350,23 @@ impl HarnessApp {
             let mut open = true;
             egui::Window::new("프로젝트 기억").open(&mut open).default_width(650.0).show(ctx,|ui|{
                 ui.horizontal(|ui|{ui.text_edit_singleline(&mut self.memory_query);if ui.button("검색").clicked(){self.request("memory.search",json!({"projectId":self.prefs.selected_project,"query":self.memory_query}),Pending::Memory);}});
-                egui::ScrollArea::vertical().max_height(260.0).show(ui,|ui|{for memory in &self.memories{ui.label(text(memory,"content"));ui.label(RichText::new(format!("{} · {}",text(memory,"kind"),text(memory,"source"))).small());ui.separator();}});
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for memory in self.memories.clone() {
+                        ui.label(text(&memory, "content"));
+                        ui.label(RichText::new(format!("{} · {}", text(&memory, "kind"), text(&memory, "source"))).small());
+                        ui.horizontal(|ui| {
+                            if ui.button("확정").clicked() {
+                                self.request("memory.confirm", json!({"id":memory["id"]}), Pending::MemoryMutation);
+                            }
+                            if ui.button("삭제").clicked() {
+                                self.request("memory.delete", json!({"id":memory["id"]}), Pending::MemoryMutation);
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
                 ui.add(egui::TextEdit::multiline(&mut self.memory_text).desired_rows(3).desired_width(f32::INFINITY).hint_text("확정된 프로젝트 지식"));
-                if ui.button("기억 추가").clicked()&&!self.memory_text.trim().is_empty(){let content=std::mem::take(&mut self.memory_text);self.request("memory.upsert",json!({"projectId":self.prefs.selected_project,"content":content,"kind":"fact","source":"사용자 직접 입력"}),Pending::Generic("기억 저장".into()));self.request("memory.list",json!({"projectId":self.prefs.selected_project}),Pending::Memory);}
+                if ui.button("기억 추가").clicked()&&!self.memory_text.trim().is_empty(){let content=std::mem::take(&mut self.memory_text);self.request("memory.upsert",json!({"projectId":self.prefs.selected_project,"content":content,"kind":"fact","source":"사용자 직접 입력"}),Pending::MemoryMutation);}
             });
             if !open {
                 self.memory_open = false;

@@ -253,11 +253,16 @@ impl HarnessApp {
         if nav_row(ui, Icon::Folder, "상위 폴더", false).clicked() {
             self.file_dir = self
                 .file_dir
-                .trim_end_matches('/')
-                .rsplit_once('/')
-                .map(|(p, _)| p)
-                .unwrap_or("")
-                .to_owned();
+                .trim_end_matches(['/', '\\'])
+                .rsplit_once(['/', '\\'])
+                .map(|(p, _)| {
+                    if p.ends_with(':') {
+                        format!("{p}\\")
+                    } else {
+                        p.to_owned()
+                    }
+                })
+                .unwrap_or_default();
             self.request(
                 "files.list",
                 json!({"sessionId":self.prefs.selected_session,"path":self.file_dir}),

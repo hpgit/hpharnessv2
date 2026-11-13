@@ -84,6 +84,8 @@ export interface Run {
   usage?: unknown;
   pendingGeneration?: string;
   migrationDeadline?: number;
+  parentRunId?: string;
+  resumedFrom?: string;
 }
 export interface Approval {
   id: string;

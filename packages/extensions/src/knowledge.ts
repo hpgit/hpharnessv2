@@ -52,6 +52,7 @@ export class KnowledgeStore {
       throw error;
     }
     this.checkpoint();
+    this.db.exec("CREATE INDEX IF NOT EXISTS sources_project_created ON sources(project,created DESC); CREATE INDEX IF NOT EXISTS sources_text_digest ON sources(text_digest); CREATE INDEX IF NOT EXISTS sources_blob_digest ON sources(digest)");
   }
   private checkpoint() {
     this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");

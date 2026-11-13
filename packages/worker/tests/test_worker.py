@@ -10,7 +10,7 @@ from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hph_worker import Worker, WorkerError, process_stamp
+from hph_worker import Worker, WorkerError, process_stamp, resource_lock
 from remote import ssh_command, prepare
 
 
@@ -70,6 +70,39 @@ class WorkerTests(unittest.TestCase):
             (self.root / "outside").symlink_to(self.root.parent, target_is_directory=True)
             with self.assertRaises(WorkerError):
                 self.worker.path("outside/secret")
+
+    def test_resource_lock_releases_when_owner_is_killed(self):
+        lock = self.worker.state / "devices" / "test-device"
+        ready = self.root / "ready"
+        script = "import sys,time;from pathlib import Path;from hph_worker import resource_lock;\nwith resource_lock(Path(sys.argv[1]),'DEVICE_BUSY'):\n Path(sys.argv[2]).touch();time.sleep(30)"
+        child = subprocess.Popen([sys.executable, "-c", script, str(lock), str(ready)], cwd=Path(__file__).resolve().parents[1])
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                if time.monotonic() > deadline:
+                    self.fail("Lock owner did not become ready")
+                time.sleep(.01)
+            with self.assertRaises(WorkerError) as caught:
+                with resource_lock(lock, "DEVICE_BUSY"):
+                    self.fail("Concurrent lock acquired")
+            self.assertEqual(caught.exception.code, "DEVICE_BUSY")
+            child.kill()
+            child.wait(timeout=10)
+            # Windows may signal process exit before the kernel releases file locks.
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    with resource_lock(lock, "DEVICE_BUSY"):
+                        self.assertTrue(lock.is_file())
+                    break
+                except WorkerError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.01)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
 
     def test_concurrent_writes_cannot_both_accept_one_base(self):
         first = self.worker.dispatch("files.write", {"path": "same.txt", "content": "base", "expected_hash": None})
@@ -176,6 +209,38 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("error", lines[0])
         self.assertEqual(lines[1]["id"], 2)
         self.assertEqual(lines[1]["result"]["root"], str(self.root.resolve()))
+
+    def test_sdk_owner_verifies_integrity_after_request_worker_dies(self):
+        (self.root / "original.onnx").write_bytes(b"baseline")
+        self.worker.dispatch("sdk.register", {"name": "interrupted", "sdk": "custom", "approved": True,
+            "argv": [sys.executable, "-c", "import pathlib,sys,time;pathlib.Path(sys.argv[1]).write_bytes(b'changed');time.sleep(30)", "{original_onnx}"]})
+        request = {"id": 1, "method": "sdk.run", "params": {"name": "interrupted", "approved": True,
+            "original_onnx": "original.onnx", "output": "result.bin", "timeout": .5}}
+        script = Path(__file__).resolve().parents[1] / "hph_worker.py"
+        child = subprocess.Popen([sys.executable, str(script), "--root", str(self.root), "--state-dir", str(self.worker.state)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            child.stdin.write((json.dumps(request) + "\n").encode())
+            child.stdin.flush()
+            deadline = time.monotonic() + 10
+            while (self.root / "original.onnx").read_bytes() != b"changed":
+                if time.monotonic() > deadline:
+                    self.fail("SDK command did not start")
+                time.sleep(.01)
+            child.terminate()
+            child.wait(timeout=10)
+            audits = list((self.worker.state / "sdk-runs").glob("*.json"))
+            self.assertEqual(len(audits), 1)
+            audit = json.loads(audits[0].read_text(encoding="utf-8"))
+            self.wait(audit.get("job_id") or audit["run"]["job_id"])
+            audit = json.loads(audits[0].read_text(encoding="utf-8"))
+            self.assertEqual(audit["audit_status"], "complete")
+            self.assertFalse(audit["original_unchanged"])
+            self.assertIn("integrity_error", audit)
+            self.assertEqual(audit["run"]["status"], "failed")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
 
     def test_remote_alias_validation_and_shell_quoting(self):
         command = ssh_command("wsl", ["python3", "-c", "print('hello')", "path with spaces;$x"])

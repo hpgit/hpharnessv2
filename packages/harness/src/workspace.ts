@@ -1,12 +1,21 @@
 import { spawn } from "node:child_process";
 import { promises as fs, existsSync } from "node:fs";
 import { resolve, relative, isAbsolute, dirname, basename } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Session, RpcError, Settings } from "./types.js";
 export const hash = (text: string) =>
   createHash("sha256").update(text).digest("hex");
+function terminateTree(child: ReturnType<typeof spawn>) {
+  if (!child.pid) return;
+  if (process.platform === "win32") {
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    killer.on("error", () => child.kill());
+  } else {
+    try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+  }
+}
 export class Workspace {
-  constructor(private settings: () => Settings) {}
+  constructor(private settings: () => Settings, private dataDir?: string) {}
   async path(session: Session, path = ".", writing = false) {
     const root = await fs.realpath(session.cwd);
     const candidate = resolve(root, path);
@@ -26,10 +35,18 @@ export class Workspace {
       actual = await fs.realpath(candidate);
     } catch (e: any) {
       if (e.code !== "ENOENT" || !writing) throw e;
-      actual = resolve(
-        await fs.realpath(dirname(candidate)),
-        basename(candidate),
-      );
+      let ancestor = dirname(candidate);
+      const missing = [basename(candidate)];
+      for (;;) {
+        try {
+          actual = resolve(await fs.realpath(ancestor), ...missing);
+          break;
+        } catch (error: any) {
+          if (error.code !== "ENOENT") throw error;
+          missing.unshift(basename(ancestor));
+          ancestor = dirname(ancestor);
+        }
+      }
     }
     const realRel = relative(root, actual);
     if (
@@ -45,8 +62,11 @@ export class Workspace {
     session: Session,
     method: string,
     params: Record<string, unknown>,
+    signal?: AbortSignal,
   ) {
+    if (signal?.aborted) throw new RpcError("CANCELLED", "Worker request cancelled");
     const settings = this.settings();
+    if (method === "sdk.run" && params.timeout === undefined) params = { ...params, timeout: 600 };
     const localPython = resolve(
       ".venv",
       process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
@@ -94,7 +114,7 @@ export class Workspace {
     }
     return this.jsonProcess(
       python,
-      ["-u", worker, "--root", session.cwd],
+      ["-u", worker, "--root", session.cwd, ...(this.dataDir ? ["--mail-root", resolve(this.dataDir, "knowledge")] : [])],
       JSON.stringify({ id: 1, method, params }),
     );
   }
@@ -106,23 +126,27 @@ export class Workspace {
     return new Promise((res, rej) => {
       const child = spawn(command, args, {
         windowsHide: true,
+        detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
       });
       let out = "",
         err = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdin.on("error", (error) => { clearTimeout(timer); rej(error); });
       const timer = setTimeout(() => {
-        child.kill();
+        terminateTree(child);
         rej(
           new RpcError(
             "WORKER_TIMEOUT",
             "Worker response timed out; side effects may need inspection",
           ),
         );
-      }, 300_000);
+      }, Math.max(300_000, (Number(JSON.parse(request).params?.timeout) || 0) * 1000 + 60_000));
       child.stdout.on("data", (chunk) => {
         out += chunk;
         if (out.length > 20_000_000) {
-          child.kill();
+          terminateTree(child);
           rej(new RpcError("TOO_LARGE", "Worker response exceeds 20 MB"));
         }
       });
@@ -213,7 +237,10 @@ export class Workspace {
         "FILE_TOO_LARGE",
         "Editor limit is 4 MB; use an artifact preview",
       );
-    const content = await fs.readFile(full, "utf8");
+    const bytes = await fs.readFile(full);
+    let content: string;
+    try { content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
+    catch { throw new RpcError("BINARY_FILE", "File is not valid UTF-8 text"); }
     if (content.includes("\0"))
       throw new RpcError("BINARY_FILE", "File is not text");
     return { path, content, version: hash(content) };
@@ -273,13 +300,13 @@ export class Workspace {
       return { path, version: result.hash ?? hash(content) };
     }
     const full = await this.path(session, path, true);
-    let old: string | undefined;
+    let old: Buffer | undefined;
     try {
-      old = await fs.readFile(full, "utf8");
+      old = await fs.readFile(full);
     } catch (e: any) {
       if (e.code !== "ENOENT") throw e;
     }
-    if (old !== undefined && hash(old) !== baseVersion)
+    if (old !== undefined && createHash("sha256").update(old).digest("hex") !== baseVersion)
       throw new RpcError(
         "VERSION_CONFLICT",
         "File changed since it was read; reload and review the diff",
@@ -289,17 +316,19 @@ export class Workspace {
         "VERSION_CONFLICT",
         "File was removed since it was read",
       );
-    const temp = full + ".hph-" + Date.now() + ".tmp";
+    await fs.mkdir(dirname(full), { recursive: true });
+    await this.path(session, path, true);
+    const temp = full + ".hph-" + randomUUID() + ".tmp";
     const mode = old === undefined ? undefined : (await fs.stat(full)).mode;
     await fs.writeFile(temp, content, { flag: "wx", mode });
     try {
-      let latest: string | undefined;
+      let latest: Buffer | undefined;
       try {
-        latest = await fs.readFile(full, "utf8");
+        latest = await fs.readFile(full);
       } catch (error: any) {
         if (error.code !== "ENOENT") throw error;
       }
-      if (latest !== old)
+      if (latest === undefined ? old !== undefined : old === undefined || !latest.equals(old))
         throw new RpcError(
           "VERSION_CONFLICT",
           "File changed during preparation; reload and review the diff",
@@ -323,28 +352,49 @@ export class Workspace {
       argv.some((a) => typeof a !== "string" || a.includes("\0"))
     )
       throw new RpcError("INVALID_ARGUMENT", "argv must be nonempty strings");
-    if (session.target.kind === "ssh" || session.target.container)
-      return this.remote(session, "command.run", {
+    if (signal?.aborted) throw new RpcError("CANCELLED", "Command cancelled");
+    if (session.target.kind === "ssh" || session.target.container) {
+      const job = await this.remote(session, "jobs.start", {
         argv,
         cwd: cwd ?? ".",
         timeout: 120,
       });
+      let cancelled = false;
+      for (;;) {
+        if (signal?.aborted && !cancelled) {
+          await this.remote(session, "jobs.cancel", { job_id: job.job_id });
+          cancelled = true;
+        }
+        const result = await this.remote(session, "jobs.status", { job_id: job.job_id });
+        if (["completed", "failed", "cancelled", "timed_out", "unknown"].includes(result.status)) return result;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
     const workdir = await this.path(session, cwd ?? ".");
     return new Promise((res, rej) => {
       const child = spawn(argv[0], argv.slice(1), {
         cwd: workdir,
         windowsHide: true,
-        signal,
+        detached: process.platform !== "win32",
         stdio: ["ignore", "pipe", "pipe"],
       });
       let stdout = "",
         stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      let timedOut = false;
+      const cancel = () => terminateTree(child);
+      const timer = setTimeout(() => { timedOut = true; cancel(); }, 120_000);
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
+      const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", cancel); };
       child.stdout.on("data", (b) => (stdout = (stdout + b).slice(-1_000_000)));
       child.stderr.on("data", (b) => (stderr = (stderr + b).slice(-1_000_000)));
-      child.on("error", rej);
-      child.on("close", (exitCode, signal) =>
-        res({ stdout, stderr, exitCode, signal }),
-      );
+      child.on("error", (error) => { cleanup(); rej(error); });
+      child.on("close", (exitCode, exitSignal) => {
+        cleanup();
+        res({ stdout, stderr, exitCode, signal: exitSignal, status: timedOut ? "timed_out" : signal?.aborted ? "cancelled" : exitCode === 0 ? "completed" : "failed" });
+      });
     });
   }
 }

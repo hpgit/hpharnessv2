@@ -17,9 +17,10 @@ export class Configuration {
   validate(input: any): Settings {
     if (!input || typeof input !== "object")
       throw new RpcError("INVALID_CONFIG", "Settings must be an object");
+    const { configPath: _path, configError: _error, ...settings } = input;
     const value = {
       ...defaults,
-      ...input,
+      ...settings,
       provider: { ...defaults.provider, ...input.provider },
       permissions: { ...defaults.permissions, ...input.permissions },
     };
@@ -49,8 +50,9 @@ export class Configuration {
         value.retryLimit > 10)
     )
       throw new RpcError("INVALID_CONFIG", "retryLimit must be 0..10");
-    for (const field of ["projectOverrides", "sessionOverrides"])
-      for (const override of Object.values(value[field] ?? {}) as any[]) {
+    for (const field of ["projectOverrides", "sessionOverrides"]) {
+      const overlays: Record<string, Partial<Settings>> = {};
+      for (const [id, override] of Object.entries(value[field] ?? {}) as [string, any][]) {
         if (
           !override ||
           typeof override !== "object" ||
@@ -66,7 +68,11 @@ export class Configuration {
           provider: { ...value.provider, ...override.provider },
           permissions: { ...value.permissions, ...override.permissions },
         });
+        const { configPath: _overlayPath, configError: _overlayError, ...clean } = override;
+        overlays[id] = clean;
       }
+      if (value[field] !== undefined) value[field] = overlays;
+    }
     if (
       value.maxSteps !== undefined &&
       (!Number.isInteger(value.maxSteps) || value.maxSteps < 1)
@@ -80,6 +86,10 @@ export class Configuration {
         throw new RpcError("INVALID_CONFIG", "Invalid permission");
     if (value.provider.baseUrl && !/^https?:\/\//.test(value.provider.baseUrl))
       throw new RpcError("INVALID_CONFIG", "Provider baseUrl requires http(s)");
+    if (!["responses", "chat-completions", "anthropic", "openai-compatible"].includes(value.provider.protocol))
+      throw new RpcError("INVALID_CONFIG", "Unsupported provider protocol");
+    if (value.provider.timeoutMs !== undefined && (!Number.isInteger(value.provider.timeoutMs) || value.provider.timeoutMs < 1 || value.provider.timeoutMs > 2147483647))
+      throw new RpcError("INVALID_CONFIG", "provider.timeoutMs must be 1..2147483647");
     return value;
   }
   reload() {
@@ -94,6 +104,7 @@ export class Configuration {
     return this.value;
   }
   update(input: Partial<Settings>) {
+    this.reload();
     const next = this.validate({
       ...this.value,
       ...input,
@@ -108,6 +119,7 @@ export class Configuration {
     return next;
   }
   effective(projectId?: string, sessionId?: string) {
+    this.reload();
     const project =
       (projectId && this.value.projectOverrides?.[projectId]) || {};
     const session =

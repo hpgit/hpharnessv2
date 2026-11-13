@@ -5,7 +5,35 @@ import {
   languageServers,
   Extensions,
   serverLaunch,
+  textChunks,
 } from "./index.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+test("embedding chunks bound document requests and preserve image and text vectors", async () => {
+  assert.deepEqual(textChunks("😀😀😀", 2, 1), ["😀😀", "😀😀"]);
+  assert.throws(() => textChunks("text", 2, 2));
+  const root = mkdtempSync(join(tmpdir(), "hph-embedding-chunks-"));
+  const extensions = new Extensions(root);
+  const calls: any[] = [];
+  const vector = (image: boolean) => { const v = Array(768).fill(0); v[image ? 1 : 0] = 1; return v; };
+  (extensions as any).embedding = { close() {}, async request(_method: string, p: any) {
+    if (p.items.length > 8) throw new Error("Embedding worker accepts at most eight items");
+    calls.push(p);
+    return { fingerprint: "model", vectors: p.items.map((item: any) => vector(item.kind === "image")) };
+  } };
+  try {
+    const source = await extensions.handle("knowledge.ingest", { projectId: "p", source: "test", title: "test", text: "long document ".repeat(3000) });
+    const text = await extensions.handle("embedding.index", { sourceId: source.id, kind: "code" });
+    assert.ok(text.chunks > 16);
+    assert.ok(calls.every((call) => call.items.length <= 8 && call.items.every((item: any) => item.kind === "code" && item.text.length <= 1200)));
+    await extensions.handle("embedding.index", { sourceId: source.id, imagePath: "image.png" });
+    const found = await extensions.handle("semantic.search", { projectId: "p", query: "long" });
+    assert.equal(found.results.length, 1);
+    assert.equal(found.results[0].similarity, 1);
+  } finally { extensions.close(); rmSync(root, { recursive: true, force: true }); }
+});
 test("SSH LSP preserves POSIX URI and shell-quotes argument boundaries", () => {
   const s = serverLaunch({
     command: "clangd",

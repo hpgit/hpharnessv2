@@ -6,6 +6,18 @@ import { BrowserService } from "./browser.js";
 import { KnowledgeStore } from "./knowledge.js";
 import { handleGit } from "./git.js";
 import { VectorIndex } from "./vectors.js";
+export function textChunks(text: string, size = 1200, overlap = 128): string[] {
+  if (!Number.isInteger(size) || !Number.isInteger(overlap) || size < 1 || overlap < 0 || overlap >= size)
+    throw new Error("Invalid chunk bounds");
+  const points = Array.from(text);
+  const chunks: string[] = [];
+  for (let start = 0; start < points.length; start += size - overlap) {
+    if (chunks.length >= 2048) throw new Error("Source exceeds 2048 embedding chunks; split it into smaller sources");
+    chunks.push(points.slice(start, start + size).join(""));
+    if (start + size >= points.length) break;
+  }
+  return chunks;
+}
 
 export interface ServerConfig {
   command: string;
@@ -314,30 +326,33 @@ export class Extensions {
     if (method === "embedding.index") {
       if (!this.embedding || !this.knowledge || !this.vectors)
         throw new Error("Configure embedding and knowledge storage");
-      const source = this.knowledge.handle("knowledge.read", {
+      const source = this.knowledge.handle("knowledge.metadata", {
         id: p.sourceId,
       });
-      const response = await this.embedding.request("embedding.embed", {
-        purpose: "document",
-        items: [
-          p.imagePath
-            ? { kind: "image", path: p.imagePath }
-            : {
-                kind: p.kind ?? "text",
-                title: source.title,
-                text: source.text,
-              },
-        ],
-      });
+      const modality = p.imagePath ? "image" : "text";
+      if (!p.imagePath && p.kind && !["text", "code"].includes(p.kind)) throw new Error("Image indexing requires imagePath");
+      const items = p.imagePath ? [{ kind: "image", path: p.imagePath }] : textChunks(String(source.text || source.title)).map((text) => ({ kind: p.kind ?? "text", title: String(source.title).slice(0, 512), text }));
       const usage = this.knowledge.handle("knowledge.usage", {});
-      if (usage.bytes + 65536 > usage.limit)
+      if (usage.bytes + 65536 + items.length * 32768 > usage.limit)
         throw new Error(
           "Collection quota reached; embedding cache write paused",
         );
-      this.vectors.put(source.id, response.fingerprint, response.vectors[0]);
+      let fingerprint: string | undefined;
+      const vectors: number[][] = [];
+      for (let offset = 0; offset < items.length; offset += 8) {
+        const batch = items.slice(offset, offset + 8);
+        const response = await this.embedding.request("embedding.embed", { purpose: "document", items: batch });
+        if (!response.fingerprint || (fingerprint && fingerprint !== response.fingerprint) || response.vectors?.length !== batch.length)
+          throw new Error("Embedding worker returned inconsistent batches");
+        fingerprint = response.fingerprint;
+        vectors.push(...response.vectors);
+      }
+      this.vectors.replace(source.id, fingerprint!, modality, vectors);
       return {
         sourceId: source.id,
-        fingerprint: response.fingerprint,
+        fingerprint,
+        modality,
+        chunks: vectors.length,
         dimensions: 768,
       };
     }

@@ -3,7 +3,7 @@ import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createServer, createConnection, Socket } from "node:net";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual, createHash } from "node:crypto";
 import { promises as fs, openSync, closeSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { Harness } from "./src/harness.js";
@@ -15,7 +15,33 @@ const dataDir = resolve(
     : (process.env.HPH_DATA_DIR ?? resolve(homedir(), ".hpharness")),
 );
 const descriptor = join(dataDir, "daemon.json");
-type Descriptor = { port: number; token: string; pid: number; version: 1 };
+type Descriptor = { port: number; token: string; pid: number; version: 1; build?: string };
+async function buildId() {
+  const hash = createHash("sha256");
+  for (const directory of [new URL("./", import.meta.url), new URL("./src/", import.meta.url), new URL("../../providers/dist/", import.meta.url), new URL("../../extensions/dist/", import.meta.url)]) {
+    for (const name of (await fs.readdir(directory)).filter((name) => name.endsWith(".js")).sort())
+      hash.update(await fs.readFile(new URL(name, directory)));
+  }
+  return hash.digest("hex");
+}
+async function control(value: Descriptor, method: string): Promise<any> {
+  const socket = await connect(value);
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    socket.on("error", reject);
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      for (const line of buffer.split("\n").slice(0, -1)) {
+        const reply = JSON.parse(line);
+        if (reply.id === "control") {
+          socket.destroy();
+          resolve(reply);
+        }
+      }
+    });
+    socket.write(JSON.stringify({ id: "control", token: value.token, method }) + "\n");
+  });
+}
 const send = (socket: Socket, message: unknown) => {
   if (!socket.destroyed) socket.write(JSON.stringify(message) + "\n");
 };
@@ -25,18 +51,40 @@ async function daemon() {
   let lock;
   try {
     lock = await fs.open(lockPath, "wx", 0o600);
-    await lock.writeFile(String(process.pid));
+    await lock.writeFile(JSON.stringify({ pid: process.pid, instance: randomBytes(16).toString("hex") }));
   } catch (e: any) {
     if (e.code !== "EEXIST") throw e;
-    const pid = Number(await fs.readFile(lockPath, "utf8"));
+    const contents = await fs.readFile(lockPath, "utf8");
+    let owner: any;
+    try { owner = JSON.parse(contents); } catch {}
+    const modern = owner && typeof owner === "object" && typeof owner.instance === "string";
+    const pid = Number(modern ? owner.pid : contents);
+    let alive = false;
     try {
+      if (!Number.isInteger(pid) || pid < 1) throw new Error("Invalid lock PID");
       process.kill(pid, 0);
-      return;
+      alive = true;
+      const existing: Descriptor = JSON.parse(await fs.readFile(descriptor, "utf8"));
+      if (existing.pid === pid && (await control(existing, "ping")).result?.pid === pid) return;
     } catch {
-      await fs.unlink(lockPath);
-      return daemon();
+      // A live reused PID alone is insufficient evidence that this daemon owns it.
     }
+    const stat = await fs.stat(lockPath);
+    if (modern && alive) {
+      if (Date.now() - stat.mtimeMs < 5000) return;
+      throw new Error(`Daemon lock belongs to live PID ${pid}, but its authenticated listener is unavailable. Inspect ${descriptor} and ${lockPath}; verify that PID owns the daemon before removing a stale lock.`);
+    }
+    if ((alive || !Number.isInteger(pid) || pid < 1) && Date.now() - stat.mtimeMs < 5000) return;
+    if (await fs.readFile(lockPath, "utf8") !== contents) return;
+    await fs.unlink(lockPath);
+    return daemon();
   }
+  // Keep the ownership lease fresh during slow initialization, before a listener exists.
+  const heartbeat = setInterval(() => {
+    const now = new Date();
+    void lock!.utimes(now, now).catch(() => {});
+  }, 1000);
+  heartbeat.unref();
   const clients = new Set<Socket>();
   const authenticated = new Set<Socket>();
   const token = randomBytes(32).toString("hex");
@@ -85,6 +133,11 @@ async function daemon() {
             authenticated.add(socket);
             if (typeof request.method !== "string")
               throw new Error("method required");
+            if (request.method === "daemon.shutdown") {
+              send(socket, { id: request.id, result: { shuttingDown: true } });
+              setImmediate(() => void close());
+              return;
+            }
             const result = await harness.rpc(request.method, request.params);
             send(socket, { id: request.id, result });
           } catch (error: any) {
@@ -108,6 +161,7 @@ async function daemon() {
     token,
     pid: process.pid,
     version: 1,
+    build: await buildId(),
   };
   await fs.writeFile(descriptor + ".tmp", JSON.stringify(value), {
     mode: 0o600,
@@ -120,6 +174,7 @@ async function daemon() {
     for (const socket of clients) socket.end();
     server.close();
     await harness.close();
+    clearInterval(heartbeat);
     await lock!.close();
     await fs.rm(lockPath, { force: true });
     await fs.rm(descriptor, { force: true });
@@ -141,10 +196,23 @@ async function connect(value: Descriptor) {
 async function client() {
   await fs.mkdir(dataDir, { recursive: true });
   let value: Descriptor | undefined, socket: Socket | undefined;
+  let incompatible: Error | undefined;
   try {
     value = JSON.parse(await fs.readFile(descriptor, "utf8"));
-    socket = await connect(value!);
+    if (args.includes("--shutdown") || value!.build !== await buildId()) {
+      const reply = await control(value!, "daemon.shutdown");
+      if (reply.error) {
+        incompatible = new Error(`Running daemon PID ${value!.pid} cannot shut down (${reply.error.message}). Stop it before reconnecting to the rebuilt harness.`);
+        throw incompatible;
+      }
+      for (let attempt = 0; attempt < 100; attempt++) {
+        try { await fs.access(descriptor); } catch { break; }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } else socket = await connect(value!);
   } catch {}
+  if (incompatible) throw incompatible;
+  if (args.includes("--shutdown")) return;
   if (!socket) {
     const fd = openSync(join(dataDir, "daemon.log"), "a");
     spawn(

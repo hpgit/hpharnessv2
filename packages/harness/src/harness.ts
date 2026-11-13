@@ -3,7 +3,7 @@ import { resolve, join } from "node:path";
 import { promises as fs } from "node:fs";
 import { Store } from "./store.js";
 import { Configuration } from "./config.js";
-import { compact } from "./context.js";
+import { compact, repairToolHistory } from "./context.js";
 import { CoreManager } from "./core.js";
 import { Workspace, hash } from "./workspace.js";
 import { Extensions } from "@hpharness/extensions";
@@ -43,6 +43,8 @@ const extensionReadMethods = new Set([
   "worker.jobs.list",
   "worker.sdk.list",
   "worker.office.ppt_templates",
+  "worker.office.word_read",
+  "worker.office.excel_read",
   "worker.desktop.windows",
   "worker.desktop.read",
 ]);
@@ -86,7 +88,7 @@ export const tools = [
       [...extensionReadMethods].join(", ") +
       ". Other supported actions require individual approval: " +
       [...extensionWriteMethods].join(", ") +
-      ". Process launch configuration is user-only.",
+      ". Desktop lease approval authorizes actions on that window until expiry or user input; actions/revoke do not ask again. Process launch configuration is user-only.",
     parameters: schema(
       { method: str, params: { type: "object", additionalProperties: true } },
       ["method", "params"],
@@ -136,9 +138,14 @@ export const tools = [
     parameters: schema({ query: str }, ["query"]),
   },
   {
+    name: "artifact_read",
+    description: "Read a bounded page from an original tool result using its artifact id; offset and limit are character counts.",
+    parameters: schema({ id: str, offset: { type: "integer" }, limit: { type: "integer" } }, ["id"]),
+  },
+  {
     name: "memory_remember",
     description:
-      "Record an explicit fact, decision or candidate inference with provenance",
+      "Propose a candidate memory with provenance. Only explicit user confirmation promotes it to shared project knowledge.",
     parameters: schema(
       {
         content: str,
@@ -196,6 +203,10 @@ export class Harness {
   private resumeWaiters: Array<() => void> = [];
   private closing = false;
   private fileWrites: Promise<unknown> = Promise.resolve();
+  private coreWrites: Promise<unknown> = Promise.resolve();
+  private collectionWrites: Promise<unknown> = Promise.resolve();
+  private desktopLeases = new Map<string, string>();
+  private budgets = new Map<string, { steps: number; tokens: number; maxSteps?: number; maxTokens?: number; deadline?: number }>();
   constructor(
     readonly dataDir: string,
     private notify: Notify = () => {},
@@ -204,7 +215,7 @@ export class Harness {
     this.store = new Store(join(dataDir, "harness.sqlite"));
     this.config = new Configuration(join(dataDir, "settings.yaml"));
     this.core = new CoreManager((event, data) => this.emit(event, data));
-    this.workspace = new Workspace(() => this.config.value);
+    this.workspace = new Workspace(() => this.config.value, dataDir);
     this.extensions = new Extensions(dataDir);
     for (const run of this.store.list<Run>("run"))
       if (
@@ -225,8 +236,41 @@ export class Harness {
       }
   }
   async start() {
-    await this.core.load();
+    const active = this.store.get<any>("core-state", "active");
+    try {
+      if (active?.path && hash(await fs.readFile(active.path, "utf8")) !== active.hash)
+        throw new Error("Persisted core candidate changed");
+      await this.core.load(active?.path);
+    } catch (error) {
+      await this.core.load();
+      this.store.put("core-state", { id: "active" });
+      this.emit("core.restoreFailed", { error: String(error) });
+    }
+    for (const proposal of this.store.list<any>("improvement")) {
+      if (proposal.status === "trial" && proposal.candidatePath !== this.core.current.path) {
+        proposal.status = "invalidated";
+        proposal.invalidationReason = "The candidate is not the active core after restart";
+        this.store.put("improvement", proposal);
+      }
+    }
     return this;
+  }
+  private async activateCore(filePath?: string, expectedHash?: string) {
+    const path = filePath ? resolve(filePath) : undefined;
+    const digest = path ? hash(await fs.readFile(path, "utf8")) : undefined;
+    if (expectedHash && digest !== expectedHash) throw new RpcError("CANDIDATE_CHANGED", "Core changed since it was activated");
+    const previous = this.core.current;
+    // Retain the old generation until the durable pointer has been committed.
+    if (previous) this.core.acquire(previous.id);
+    try {
+      const next = await this.core.load(path);
+      try { this.store.put("core-state", { id: "active", ...{ path, hash: digest } }); }
+      catch (error) {
+        if (previous) this.core.current = previous;
+        throw error;
+      }
+      return next;
+    } finally { if (previous) await this.core.release(previous.id); }
   }
   private emit(event: string, data: unknown) {
     const saved = this.store.event(event, data);
@@ -268,9 +312,7 @@ export class Harness {
     return this.require<Session>("session", params.sessionId);
   }
   private messages(sessionId: string) {
-    return this.store
-      .list<Message>("message")
-      .filter((m) => m.sessionId === sessionId);
+    return this.store.messages<Message>(sessionId);
   }
   private effectiveSettings(session: Session) {
     return this.config.effective(
@@ -308,6 +350,14 @@ export class Harness {
     return msg;
   }
   async rpc(method: string, p: any = {}): Promise<any> {
+    if (["core.reload", "improvements.apply", "improvements.rollback", "improvements.validate", "improvements.evaluate"].includes(method)) {
+      const task = this.coreWrites.then(() => this.dispatchRpc(method, p));
+      this.coreWrites = task.catch(() => {});
+      return task;
+    }
+    return this.dispatchRpc(method, p);
+  }
+  private async dispatchRpc(method: string, p: any = {}): Promise<any> {
     if (!p || typeof p !== "object" || Array.isArray(p))
       throw new RpcError("INVALID_ARGUMENT", "params must be an object");
     if (method.startsWith("git.")) {
@@ -328,7 +378,7 @@ export class Harness {
         "semantic.",
       ].some((prefix) => method.startsWith(prefix))
     )
-      return this.extensions.handle(method, p);
+      return this.callExtension(method, p);
     switch (method) {
       case "ping":
         return {
@@ -369,7 +419,7 @@ export class Harness {
         const session: Session = {
           id: randomUUID(),
           projectId: project.id,
-          title: p.title || "???묒뾽",
+          title: p.title || "새 작업",
           target: this.target(p.target ?? project.target),
           cwd: p.cwd ?? project.root,
           createdAt: new Date().toISOString(),
@@ -383,7 +433,7 @@ export class Harness {
         const session: Session = {
           ...original,
           id: randomUUID(),
-          title: p.title ?? original.title + " 쨌 遺꾧린",
+          title: p.title ?? original.title + " · 분기",
           parentId: original.id,
           createdAt: new Date().toISOString(),
         };
@@ -394,7 +444,7 @@ export class Harness {
         if (stop < 0)
           throw new RpcError("NOT_FOUND", "Branch message not found");
         this.store.put("session", session);
-        for (const m of messages.slice(0, stop + 1))
+        for (const m of repairToolHistory(messages.slice(0, stop + 1)))
           this.addMessage(session.id, m.role, m.content, {
             toolCalls: m.toolCalls,
             toolCallId: m.toolCallId,
@@ -430,6 +480,15 @@ export class Harness {
         return this.messages(this.session(p).id);
       case "runs.start":
         return this.enqueue(this.session(p), this.text(p.input, "input"));
+      case "runs.resume": {
+        const previous = this.require<Run>("run", p.runId);
+        if (previous.status !== "interrupted") throw new RpcError("INVALID_STATE", "Only interrupted runs can be resumed");
+        const next = this.enqueue(this.require<Session>("session", previous.sessionId), this.text(p.input, "input"));
+        const live = this.live.get(next.id)!;
+        live.run.resumedFrom = previous.id;
+        this.store.put("run", live.run);
+        return live.run;
+      }
       case "runs.status":
         return p.runId
           ? this.require<Run>("run", p.runId)
@@ -446,14 +505,17 @@ export class Harness {
       }
       case "runs.cancel": {
         const run = this.require<Run>("run", p.runId);
+        if (["completed", "failed", "cancelled", "interrupted"].includes(run.status)) return run;
         const live = this.live.get(run.id);
         live?.abort.abort();
         this.cancelApprovals(run.id);
         if (live?.run.status === "queued") {
           await this.core.release(live.run.generation);
           this.live.delete(run.id);
+          this.budgets.delete(run.id);
         }
         run.status = "cancelled";
+        if (live) live.run.status = "cancelled";
         this.store.put("run", run);
         this.emit("run.changed", run);
         return run;
@@ -480,7 +542,7 @@ export class Harness {
         return this.core.status();
       case "core.reload": {
         const old = this.core.current.id;
-        const next = await this.core.load(p.filePath);
+        const next = await this.activateCore(p.filePath);
         if (p.migrateActive)
           for (const live of this.live.values())
             if (live.run.status !== "queued") {
@@ -497,6 +559,7 @@ export class Harness {
         return this.core.status();
       }
       case "settings.get":
+        this.config.reload();
         return {
           ...this.config.value,
           configPath: this.config.path,
@@ -551,10 +614,29 @@ export class Harness {
         const memory = this.store.memoryUpsert({
           ...p,
           content: this.text(p.content, "content"),
+          confirmed: p.kind !== "candidate",
         });
         this.emit("memory.changed", memory);
         return memory;
       }
+      case "memory.confirm": {
+        const previous = this.store.memoryGet(this.text(p.id, "id"));
+        if (!previous) throw new RpcError("NOT_FOUND", "Memory not found");
+        const memory = this.store.memoryUpsert({
+          id: String(previous.id), projectId: previous.projectId == null ? undefined : String(previous.projectId),
+          content: String(previous.content), source: String(previous.source),
+          kind: previous.kind === "candidate" ? "fact" : String(previous.kind), confirmed: true,
+        });
+        this.emit("memory.changed", memory);
+        return memory;
+      }
+      case "memory.delete": {
+        const result = this.store.memoryDelete(this.text(p.id, "id"));
+        this.emit("memory.deleted", result);
+        return result;
+      }
+      case "artifacts.read":
+        return this.readArtifact(p);
       case "improvements.list":
         return this.store.list<any>("improvement");
       case "improvements.propose": {
@@ -630,8 +712,10 @@ export class Harness {
             "Candidate changed after validation; validate again",
           );
         const previous = this.core.current;
-        const next = await this.core.load(proposal.candidatePath);
+        const previousHash = this.store.get<any>("core-state", "active")?.hash;
+        const next = await this.activateCore(proposal.candidatePath, proposal.candidateHash);
         proposal.previousCorePath = previous.path;
+        proposal.previousCoreHash = previousHash;
         proposal.previousCoreVersion = previous.core.version;
         proposal.appliedGeneration = next.id;
         proposal.status = "trial";
@@ -642,7 +726,7 @@ export class Harness {
       }
       case "improvements.evaluate": {
         const proposal = this.require<any>("improvement", p.id);
-        if (proposal.status !== "trial")
+        if (proposal.status !== "trial" || proposal.candidatePath !== this.core.current.path)
           throw new RpcError(
             "INVALID_STATE",
             "Apply the proposal before evaluation",
@@ -660,12 +744,12 @@ export class Harness {
       }
       case "improvements.rollback": {
         const proposal = this.require<any>("improvement", p.id);
-        if (proposal.status !== "trial")
+        if (proposal.status !== "trial" || proposal.candidatePath !== this.core.current.path)
           throw new RpcError(
             "INVALID_STATE",
             "Only an applied proposal can be rolled back",
           );
-        await this.core.load(proposal.previousCorePath);
+        await this.activateCore(proposal.previousCorePath, proposal.previousCoreHash);
         proposal.status = "rolled_back";
         this.store.put("improvement", proposal);
         this.emit("improvement.rolledBack", {
@@ -705,7 +789,7 @@ export class Harness {
       }
       case "worker.call": {
         const session = this.session(p);
-        return this.workspace.remote(
+        return this.callWorker(
           session,
           this.text(p.method, "method"),
           p.params ?? {},
@@ -732,7 +816,45 @@ export class Harness {
     this.fileWrites = task.catch(() => {});
     return task;
   }
-  enqueue(session: Session, input: string) {
+  private collectionWrite<T>(fn: () => Promise<T>) {
+    const task = this.collectionWrites.then(fn, fn);
+    this.collectionWrites = task.catch(() => {});
+    return task;
+  }
+  private callExtension(method: string, params: any) {
+    const invoke = () => this.extensions.handle(method, params);
+    return ["knowledge.ingest", "assets.create", "assets.version", "assets.link", "embedding.index"].includes(method)
+      ? this.collectionWrite(invoke) : invoke();
+  }
+  private callWorker(session: Session, method: string, params: Record<string, unknown>, signal?: AbortSignal) {
+    const invoke = () => this.workspace.remote(session, method, params, signal);
+    return ["outlook.fetch", "outlook.attachment"].includes(method) ? this.collectionWrite(invoke) : invoke();
+  }
+  private async saveArtifact(content: string, sessionId: string, kind: string) {
+    const id = randomUUID();
+    const folder = join(this.dataDir, "artifacts");
+    await fs.mkdir(folder, { recursive: true });
+    await fs.writeFile(join(folder, id + ".txt"), content, "utf8");
+    this.store.put("artifact", { id, ...{ sessionId, kind, chars: content.length, sha256: hash(content) } });
+    return id;
+  }
+  private async readArtifact(p: any, sessionId?: string) {
+    const record = this.require<any>("artifact", p.id);
+    if (sessionId && record.sessionId !== sessionId) throw new RpcError("NOT_FOUND", "Artifact is outside this session");
+    const offset = p.offset ?? 0, limit = p.limit ?? 8000;
+    if (!Number.isInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 16000)
+      throw new RpcError("INVALID_ARGUMENT", "offset must be nonnegative and limit must be 1..16000");
+    const text = await fs.readFile(join(this.dataDir, "artifacts", record.id + ".txt"), "utf8");
+    return { id: record.id, offset, totalChars: text.length, content: text.slice(offset, offset + limit), nextOffset: offset + limit < text.length ? offset + limit : null };
+  }
+  private async boundedResult(result: unknown, session: Session) {
+    const serialized = JSON.stringify(result) ?? "null";
+    const limit = Math.max(256, Math.min(12000, Math.floor((this.effectiveSettings(session).contextMaxChars ?? 60000) / 4)));
+    if (serialized.length <= limit) return result;
+    const artifactId = await this.saveArtifact(serialized, session.id, "tool-result");
+    return { truncated: true, artifactId, originalChars: serialized.length, preview: serialized.slice(0, Math.floor(limit / 2)), readWith: "artifact_read" };
+  }
+  enqueue(session: Session, input: string, parent?: Run) {
     const run: Run = {
       id: randomUUID(),
       sessionId: session.id,
@@ -741,8 +863,13 @@ export class Harness {
       step: 0,
       input,
       createdAt: new Date().toISOString(),
+      parentRunId: parent?.id,
     };
     this.core.acquire(run.generation);
+    const settings = this.effectiveSettings(session);
+    this.budgets.set(run.id, parent ? this.budgets.get(parent.id)! : {
+      steps: 0, tokens: 0, maxSteps: settings.maxSteps, maxTokens: settings.maxTokens,
+    });
     this.store.put("run", run);
     this.live.set(run.id, { run, abort: new AbortController(), steering: [] });
     this.emit("run.queued", run);
@@ -760,11 +887,9 @@ export class Harness {
     }
     const busy = new Set(
       [...this.live.values()]
-        .filter((x) =>
-          ["running", "waiting_approval", "waiting_child"].includes(
-            x.run.status,
-          ),
-        )
+        // A cancelled execution still owns the session until its effects and
+        // cleanup have settled and execute's finally removes it from live.
+        .filter((x) => x.run.status !== "queued")
         .map((x) => x.run.sessionId),
     );
     for (const live of this.live.values())
@@ -779,6 +904,7 @@ export class Harness {
         void this.execute(live).finally(() => {
           this.running--;
           this.live.delete(live.run.id);
+          this.budgets.delete(live.run.id);
           this.pump();
         });
       }
@@ -794,7 +920,8 @@ export class Harness {
       this.modelWaiters.shift()?.();
     }
   }
-  private async approval(run: Run, session: Session, call: ToolCall) {
+  private async approval(run: Run, session: Session, call: ToolCall, signal: AbortSignal) {
+    if (signal.aborted) throw new RpcError("CANCELLED", "Run cancelled");
     const a: Approval = {
       id: randomUUID(),
       runId: run.id,
@@ -813,7 +940,7 @@ export class Harness {
     );
     this.emit("approval.requested", a);
     const allowed = await decision;
-    if ((run.status as string) !== "cancelled") run.status = "running";
+    run.status = signal.aborted ? "cancelled" : "running";
     this.store.put("run", run);
     return allowed;
   }
@@ -823,6 +950,7 @@ export class Harness {
     call: ToolCall,
     signal: AbortSignal,
   ) {
+    if (signal.aborted) throw new RpcError("CANCELLED", "Run cancelled");
     const p = call.arguments;
     const settings = this.effectiveSettings(session);
     if (!p || typeof p !== "object")
@@ -843,9 +971,10 @@ export class Harness {
       (call.name === "command_run" && settings.permissions.command === "ask") ||
       (call.name === "files_write" && settings.permissions.write === "ask") ||
       (call.name === "extension_call" &&
-        extensionWriteMethods.has(extensionMethod))
+        extensionWriteMethods.has(extensionMethod) &&
+        !["worker.desktop.action", "worker.desktop.revoke"].includes(extensionMethod))
     )
-      if (!(await this.approval(run, session, call)))
+      if (!(await this.approval(run, session, call, signal)))
         throw new RpcError("APPROVAL_DENIED", "User denied this exact action");
     if (signal.aborted) throw new RpcError("CANCELLED", "Run cancelled");
     this.emit("tool.started", {
@@ -860,20 +989,29 @@ export class Harness {
         result = await this.delegate(run, session, p, signal);
         break;
       case "extension_call": {
-        const params = (p.params ?? {}) as Record<string, unknown>;
+        const params = { ...(p.params ?? {}) as Record<string, unknown> };
+        if (["worker.desktop.lease", "worker.sdk.register", "worker.sdk.run", "worker.office.edit", "worker.office.ppt_add"].includes(extensionMethod)) params.approved = true;
+        if (["worker.desktop.action", "worker.desktop.read", "worker.desktop.revoke"].includes(extensionMethod) &&
+            this.desktopLeases.get(String(params.lease_id)) !== run.id)
+          throw new RpcError("APPROVAL_REQUIRED", "Acquire a window handoff for this run first");
         if (extensionMethod.startsWith("worker."))
-          result = await this.workspace.remote(
+          result = await this.callWorker(
             session,
             extensionMethod.slice(7),
             params,
+            signal,
           );
         else
-          result = await this.extensions.handle(extensionMethod, {
+          result = await this.callExtension(extensionMethod, {
             ...params,
             projectId: params.projectId ?? session.projectId,
           });
+        if (extensionMethod === "worker.desktop.lease") this.desktopLeases.set((result as any).lease_id, run.id);
         break;
       }
+      case "artifact_read":
+        result = await this.readArtifact(p, session.id);
+        break;
       case "instructions_list":
         result = await this.instructions(session, String(p.path ?? "."));
         break;
@@ -917,13 +1055,15 @@ export class Harness {
         result = this.store.memoryUpsert({
           projectId: session.projectId,
           content: this.text(p.content, "content"),
-          kind: String(p.kind ?? "candidate"),
-          source: String(p.source ?? run.id),
+          kind: "candidate",
+          source: `agent:${run.id}; claimed source: ${String(p.source ?? "")}`,
+          confirmed: false,
         });
         break;
       default:
         throw new RpcError("UNKNOWN_TOOL", call.name);
     }
+    result = await this.boundedResult(result, session);
     this.emit("tool.completed", { runId: run.id, callId: call.id, result });
     return result;
   }
@@ -973,6 +1113,10 @@ export class Harness {
     p: Record<string, unknown>,
     signal: AbortSignal,
   ) {
+    let ancestor: Run | undefined = run, depth = 0;
+    while (ancestor?.parentRunId) { depth++; ancestor = this.store.get<Run>("run", ancestor.parentRunId); }
+    if (depth >= 4) throw new RpcError("DELEGATION_LIMIT", "Maximum delegation depth (4) reached");
+    if (signal.aborted) throw new RpcError("CANCELLED", "Parent cancelled");
     const child: Session = {
       ...session,
       id: randomUUID(),
@@ -982,7 +1126,7 @@ export class Harness {
       createdAt: new Date().toISOString(),
     };
     this.store.put("session", child);
-    const childRun = this.enqueue(child, this.text(p.input, "input"));
+    const childRun = this.enqueue(child, this.text(p.input, "input"), run);
     this.emit("agent.delegated", {
       parentRunId: run.id,
       childRunId: childRun.id,
@@ -1010,7 +1154,7 @@ export class Harness {
     } finally {
       await new Promise<void>((resolve) => {
         const resume = () => {
-          run.status = "running";
+          run.status = signal.aborted ? "cancelled" : "running";
           this.store.put("run", run);
           resolve();
         };
@@ -1032,12 +1176,15 @@ export class Harness {
     const { run, abort } = live;
     const session = this.require<Session>("session", run.sessionId);
     const initialSettings = this.effectiveSettings(session);
-    const timer = initialSettings.maxDurationMs
+    const budget = this.budgets.get(run.id)!;
+    if (!run.parentRunId && initialSettings.maxDurationMs) budget.deadline = Date.now() + initialSettings.maxDurationMs;
+    const duration = budget.deadline ? Math.max(1, budget.deadline - Date.now()) : initialSettings.maxDurationMs;
+    const timer = duration
       ? setTimeout(() => {
           run.error = "Configured duration limit reached";
           abort.abort(new Error(run.error));
           this.cancelApprovals(run.id);
-        }, initialSettings.maxDurationMs)
+        }, duration)
       : undefined;
     this.addMessage(session.id, "user", run.input);
     this.emit("run.changed", run);
@@ -1045,8 +1192,10 @@ export class Harness {
       while (!abort.signal.aborted) {
         const settings = this.effectiveSettings(session);
         const limit = settings.maxSteps;
-        if (limit !== undefined && run.step >= limit)
+        if ((limit !== undefined && run.step >= limit) || (budget.maxSteps !== undefined && budget.steps >= budget.maxSteps))
           throw new RpcError("STEP_LIMIT", "Configured step limit reached");
+        if (budget.maxTokens !== undefined && budget.tokens >= budget.maxTokens)
+          throw new RpcError("TOKEN_LIMIT", "Configured token limit reached");
         let generation = this.core.generations.get(run.generation)!;
         if (run.pendingGeneration) {
           if (
@@ -1070,9 +1219,9 @@ export class Harness {
           this.addMessage(session.id, "user", input);
         const memories = this.store
           .memoryList(session.projectId)
-          .filter((m: any) => m.kind !== "candidate")
+          .filter((m: any) => m.confirmed === 1 && m.kind !== "candidate")
           .map((m: any) => String(m.content));
-        let messages = this.messages(session.id);
+        let messages = repairToolHistory(this.messages(session.id));
         if (generation.core.buildContext)
           messages = generation.core.buildContext(messages, memories);
         const compressed = compact(messages, settings.contextMaxChars ?? 60000);
@@ -1088,7 +1237,7 @@ export class Harness {
           instructions = (await this.workspace.read(session, "AGENTS.md"))
             .content;
         } catch {}
-        const context: Message[] = [
+        const context: Message[] = compact([
           {
             id: "system",
             sessionId: session.id,
@@ -1102,12 +1251,8 @@ export class Harness {
             createdAt: new Date().toISOString(),
           },
           ...messages,
-        ];
-        this.emit("context.sent", {
-          runId: run.id,
-          generation: run.generation,
-          messages: context,
-        });
+        ], settings.contextMaxChars ?? 60000).messages;
+        budget.steps++;
         const result = await generation.core.nextStep({
           run: structuredClone(run),
           messages: context,
@@ -1115,19 +1260,29 @@ export class Harness {
           signal: abort.signal,
           retryLimit: settings.retryLimit,
           complete: (messages = context) =>
-            this.model(() =>
-              this.invoke(
+            this.model(async () => {
+              if (abort.signal.aborted) throw new RpcError("CANCELLED", "Run cancelled");
+              const outbound = compact(repairToolHistory(messages), settings.contextMaxChars ?? 60000).messages;
+              const serialized = JSON.stringify(outbound);
+              const artifactId = await this.saveArtifact(serialized, session.id, "context");
+              if (abort.signal.aborted) throw new RpcError("CANCELLED", "Run cancelled");
+              this.emit("context.sent", {
+                runId: run.id, generation: run.generation,
+                artifactId, messageCount: outbound.length, chars: serialized.length,
+              });
+              return this.invoke(
                 this.config.provider(settings),
-                messages,
+                outbound,
                 tools,
                 abort.signal,
-              ),
-            ),
+              );
+            }),
         });
         if (abort.signal.aborted) break;
         run.step++;
         const oldUsage = (run.usage ?? {}) as any;
         const newUsage = (result.usage ?? {}) as any;
+        budget.tokens += (newUsage.inputTokens ?? 0) + (newUsage.outputTokens ?? 0);
         run.usage = {
           inputTokens:
             (oldUsage.inputTokens ?? 0) + (newUsage.inputTokens ?? 0),
@@ -1138,7 +1293,8 @@ export class Harness {
         const total =
           (run.usage as any).inputTokens + (run.usage as any).outputTokens;
         const tokenLimitReached =
-          settings.maxTokens !== undefined && total >= settings.maxTokens;
+          (settings.maxTokens !== undefined && total >= settings.maxTokens) ||
+          (budget.maxTokens !== undefined && budget.tokens >= budget.maxTokens);
         this.addMessage(session.id, "assistant", result.text, {
           toolCalls: result.toolCalls,
           providerData: result.providerData,
@@ -1146,7 +1302,8 @@ export class Harness {
         for (const call of result.toolCalls ?? []) {
           let output: unknown;
           try {
-            if (tokenLimitReached)
+            if (abort.signal.aborted) throw new RpcError("CANCELLED", "Run cancelled; no new tool action was started");
+            if (tokenLimitReached || (budget.maxTokens !== undefined && budget.tokens >= budget.maxTokens))
               throw new RpcError(
                 "TOKEN_LIMIT",
                 "Configured token limit reached; no new tool action was started",
@@ -1171,7 +1328,7 @@ export class Harness {
           step: run.step,
         });
         await generation.core.afterStep?.(structuredClone(run));
-        if (tokenLimitReached)
+        if (tokenLimitReached || (budget.maxTokens !== undefined && budget.tokens >= budget.maxTokens))
           throw new RpcError("TOKEN_LIMIT", "Configured token limit reached");
         if (!(result.continue ?? !!result.toolCalls?.length)) {
           run.status = "completed";
@@ -1184,6 +1341,11 @@ export class Harness {
       run.error = error instanceof Error ? error.message : String(error);
     } finally {
       if (timer) clearTimeout(timer);
+      for (const [leaseId, owner] of this.desktopLeases) if (owner === run.id) {
+        this.desktopLeases.delete(leaseId);
+        try { await this.workspace.remote(session, "desktop.revoke", { lease_id: leaseId }); }
+        catch (error) { this.emit("desktop.revokeFailed", { runId: run.id, leaseId, error: String(error) }); }
+      }
       this.store.put("run", run);
       this.emit("run.changed", run);
       await this.core.release(run.generation);
@@ -1211,6 +1373,7 @@ export class Harness {
         this.store.put("run", live.run);
         await this.core.release(live.run.generation);
         this.live.delete(id);
+        this.budgets.delete(id);
       }
     await this.waitForIdle();
     await this.extensions.close();
